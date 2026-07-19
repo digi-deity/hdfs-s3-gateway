@@ -8,18 +8,15 @@
 //! gateway must translate that into S3 `AccessDenied` (HTTP 403) — not a generic
 //! `InternalError` (500).
 //!
-//! Requires `mvn` + JDK on PATH (MiniDfs shells out to Maven). The `integration-test`
-//! feature on `hdfs-native` enables `hdfs_native::minidfs::MiniDfs`.
+//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow).
 
-use std::collections::HashSet;
-
-use bytes::Bytes;
-use hdfs_native::minidfs::MiniDfs;
-use hdfs_native::{Client, ClientBuilder, WriteOptions};
-use hdfs_s3_gateway::config::Config;
+use hdfs_native::ClientBuilder;
 use hdfs_s3_gateway::s3::HdfsGateway;
 use s3s::dto::*;
 use s3s::{S3Request, S3};
+
+mod common;
+use common::TestScope;
 
 fn req<T>(input: T) -> S3Request<T> {
     S3Request {
@@ -35,57 +32,27 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-async fn write_file(client: &Client, path: &str, data: &[u8]) {
-    let mut writer = client
-        .create(path, &WriteOptions::default().overwrite(true))
-        .await
-        .unwrap();
-    writer
-        .write_bytes(Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-}
-
 /// Build a gateway whose HDFS client acts as `user` (an unprivileged principal).
-fn gateway_as(dfs: &MiniDfs, user: &str) -> HdfsGateway {
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "0.0.0.0:0".to_string(),
-        max_concurrent_requests: 64,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-    let client = ClientBuilder::new()
-        .with_url(&dfs.url)
-        .with_user(user.to_string())
-        .build()
-        .unwrap();
-    HdfsGateway::new(client, config)
+fn gateway_as(scope: &TestScope, user: &str) -> HdfsGateway {
+    scope.gateway_as(user)
 }
 
 #[tokio::test]
 async fn permission_denied_maps_to_access_denied() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
+    let scope = TestScope::new().await;
 
     // Seed a secret file as the superuser (default client identity) with mode 0600 so no
     // other user can read it.
-    let secret = "/data/secret.txt";
-    write_file(
-        &ClientBuilder::new().with_url(&dfs.url).build().unwrap(),
-        secret,
-        b"topsecret",
-    )
-    .await;
-    let super_client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
-    super_client.set_permission(secret, 0o600).await.unwrap();
+    let secret = format!("{}/secret.txt", scope.root);
+    scope.write_file("secret.txt", b"topsecret").await;
+    let super_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .build()
+        .unwrap();
+    super_client.set_permission(&secret, 0o600).await.unwrap();
     super_client
-        .set_owner(secret, Some("root"), Some("supergroup"))
+        .set_owner(&secret, Some("root"), Some("supergroup"))
         .await
         .unwrap();
 
@@ -95,12 +62,12 @@ async fn permission_denied_maps_to_access_denied() {
     // itself — only the actual block-read path (`getBlockLocations`, used by GET) does.
     // So we assert on `get_object`, which is where the NameNode returns
     // `AccessControlException` and `hdfs-native` surfaces it as an `RPCError`.
-    let gateway = gateway_as(&dfs, "nobody");
+    let gateway = gateway_as(&scope, "nobody");
 
     let err = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
-            key: "data/secret.txt".into(),
+            key: "secret.txt".into(),
             ..Default::default()
         }))
         .await
@@ -116,23 +83,21 @@ async fn permission_denied_maps_to_access_denied() {
 async fn owner_can_still_read_after_chmod() {
     // Sanity: the owner (superuser) is unaffected by the restrictive mode and reads fine.
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
+    let scope = TestScope::new().await;
 
-    let path = "/data/owned.txt";
-    write_file(
-        &ClientBuilder::new().with_url(&dfs.url).build().unwrap(),
-        path,
-        b"mine",
-    )
-    .await;
-    let super_client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
-    super_client.set_permission(path, 0o600).await.unwrap();
+    let path = format!("{}/owned.txt", scope.root);
+    scope.write_file("owned.txt", b"mine").await;
+    let super_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .build()
+        .unwrap();
+    super_client.set_permission(&path, 0o600).await.unwrap();
 
-    let gateway = gateway_as(&dfs, "root");
+    let gateway = gateway_as(&scope, "root");
     let resp = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
-            key: "data/owned.txt".into(),
+            key: "owned.txt".into(),
             ..Default::default()
         }))
         .await

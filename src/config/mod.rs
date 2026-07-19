@@ -33,6 +33,11 @@ pub struct CliArgs {
     /// Override the single exposed bucket name (e.g. `hdfs`).
     #[arg(long)]
     pub bucket_name: Option<String>,
+
+    /// Optional shared secret enabling optional S3 SigV4 auth. When set, signed requests
+    /// are verified (bad signatures rejected) while unsigned requests are still accepted.
+    #[arg(long)]
+    pub auth_secret: Option<String>,
 }
 
 /// Resolved, validated gateway configuration.
@@ -87,6 +92,17 @@ pub struct Config {
     /// `HADOOP_USER_NAME` / `HADOOP_PROXY_USER` environment variables.
     #[serde(default)]
     pub hdfs_user: Option<String>,
+
+    /// Optional shared secret enabling **optional** S3 SigV4 authentication. When set,
+    /// the gateway verifies the signature on *signed* requests (rejecting bad ones) while
+    /// still accepting *unsigned* requests — so both client modes work. The gateway never
+    /// maps the access key to a user; it only checks that a signed request knew this
+    /// secret. When `None` (default), no auth provider is configured and all requests are
+    /// accepted unsigned (the original no-auth behavior). Clients then use the normal
+    /// default signing flow (any access-key id + this secret) instead of `anonymous` /
+    /// `aws_skip_signature` flags. This is NOT user identity — it is a shared password.
+    #[serde(default)]
+    pub auth_secret: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -122,6 +138,9 @@ impl Config {
         if let Some(v) = &args.bucket_name {
             config.bucket_name = v.clone();
         }
+        if let Some(v) = &args.auth_secret {
+            config.auth_secret = Some(v.clone());
+        }
 
         config.validate()?;
         Ok(config)
@@ -143,6 +162,7 @@ impl Config {
             hdfs_options: HashMap::new(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            auth_secret: None,
         })
     }
 
@@ -184,6 +204,7 @@ impl Default for Config {
             hdfs_options: HashMap::new(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            auth_secret: None,
         }
     }
 }

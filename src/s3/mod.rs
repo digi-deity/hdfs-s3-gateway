@@ -149,6 +149,8 @@ fn with_request_id<T>(mut resp: S3Response<T>, log: &mut RequestLog) -> S3Respon
     resp
 }
 
+mod auth;
+pub use auth::SharedSecretAuth;
 mod error;
 pub use error::map_hdfs_error;
 pub mod backpressure;
@@ -334,7 +336,10 @@ impl S3 for HdfsGateway {
         }
 
         let prefix = input.prefix.as_deref().unwrap_or("").to_string();
-        let delimiter = input.delimiter.as_deref();
+        // S3 semantics: an empty delimiter means "no grouping" — treat it as None so
+        // keys are returned as Contents rather than collapsing every key into the
+        // prefix itself (which `rest.find("")` would otherwise do at index 0).
+        let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
         let max_keys = input.max_keys.unwrap_or(1000) as usize;
 
         // List everything under the bucket root (recursive), then translate.

@@ -5,37 +5,30 @@
 //! without external tooling, so it runs in any dev environment. It validates the parts `s3s`
 //! can NOT cover for us: our HDFS-specific translation choices (directory handling, ETag
 //! semantics, listing pagination, write-op policy) as seen by a real HTTP S3 client.
+//!
+//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow).
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use hdfs_native::minidfs::MiniDfs;
-use hdfs_native::{Client, ClientBuilder, WriteOptions};
-use hdfs_s3_gateway::config::Config;
+use hdfs_native::ClientBuilder;
 use hdfs_s3_gateway::s3::server::{build_service, serve};
 use hdfs_s3_gateway::s3::HdfsGateway;
 use reqwest::Client as HttpClient;
 
-use bytes::Bytes;
+mod common;
+use common::TestScope;
 
 async fn start_gateway(
-    dfs: &MiniDfs,
+    scope: &TestScope,
 ) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<std::io::Result<()>>,
 ) {
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "127.0.0.1:0".to_string(),
-        max_concurrent_requests: 2048,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let config = scope.config();
+    let client = ClientBuilder::new()
+        .with_url(&config.namenode_uri)
+        .build()
+        .unwrap();
     let gateway = HdfsGateway::new(client, config.clone());
     let service = build_service(gateway, &config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -44,29 +37,20 @@ async fn start_gateway(
     (addr, handle)
 }
 
-async fn write_file(client: &Client, path: &str, data: &[u8]) {
-    let mut writer = client
-        .create(path, &WriteOptions::default().overwrite(true))
-        .await
-        .unwrap();
-    writer
-        .write_bytes(Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
+async fn write_file(scope: &TestScope, path: &str, data: &[u8]) {
+    scope.write_file(path, data).await;
 }
 
 #[tokio::test]
 async fn conformance_http() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
-    let hdfs = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let scope = TestScope::new().await;
 
     // Fixtures: a file, a directory (must NOT be an object), and a nested tree.
-    write_file(&hdfs, "/data/obj.txt", b"conformance-body").await;
-    write_file(&hdfs, "/data/dir/nested.txt", b"nested").await;
+    write_file(&scope, "data/obj.txt", b"conformance-body").await;
+    write_file(&scope, "data/dir/nested.txt", b"nested").await;
 
-    let (addr, _handle) = start_gateway(&dfs).await;
+    let (addr, _handle) = start_gateway(&scope).await;
     let base = format!("http://{addr}/hdfs");
     let http = HttpClient::builder()
         .timeout(Duration::from_secs(10))
@@ -174,4 +158,166 @@ async fn conformance_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// Stand up a gateway with `auth_secret` configured, so it accepts BOTH signed and
+/// unsigned requests (signature verification on signed, passthrough on unsigned).
+async fn start_gateway_with_auth(
+    scope: &TestScope,
+    secret: &str,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let config = scope.config_with(2048, Some(secret.to_string()));
+    let client = ClientBuilder::new()
+        .with_url(&config.namenode_uri)
+        .build()
+        .unwrap();
+    let gateway = HdfsGateway::new(client, config.clone());
+    let service = build_service(gateway, &config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(serve(listener, service, std::future::pending()));
+    (addr, handle)
+}
+
+/// Sign a GET/HEAD request with AWS SigV4 (AWS4-HMAC-SHA256) using the official
+/// `aws-sigv4` crate. We use `UNSIGNED-PAYLOAD` for the body hash, which `s3s` accepts
+/// for GET/HEAD. Returns the headers to attach to the request.
+fn sign_v4_get(
+    method: &str,
+    url: &str,
+    access_key: &str,
+    secret: &str,
+    region: &str,
+    service: &str,
+) -> Vec<(String, String)> {
+    use aws_credential_types::Credentials;
+    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+    use aws_sigv4::sign::v4;
+    use aws_smithy_runtime_api::client::identity::Identity;
+
+    let identity = Identity::new(
+        Credentials::new(access_key, secret, None, None, "static"),
+        None,
+    );
+
+    let signing_settings = SigningSettings::default();
+    let signing_params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name(service)
+        .time(SystemTime::now())
+        .settings(signing_settings)
+        .build()
+        .unwrap();
+
+    let uri = url.parse::<http::Uri>().unwrap();
+    let host = uri.authority().unwrap().as_str().to_string();
+
+    // `s3s` requires `x-amz-content-sha256` (UNSIGNED-PAYLOAD for GET/HEAD) and
+    // `x-amz-date` to be present and covered by the signature, so we supply them as
+    // pre-existing headers on the request being signed.
+    let headers: Vec<(&str, &str)> = vec![
+        ("host", host.as_str()),
+        ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+    ];
+
+    let signable_request = SignableRequest::new(
+        method,
+        url,
+        headers.into_iter(),
+        SignableBody::UnsignedPayload,
+    )
+    .unwrap();
+
+    let signing_output = sign(signable_request, &signing_params.into()).unwrap();
+    let signing_instructions = signing_output.output();
+
+    signing_instructions
+        .headers()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn auth_requires_signature_when_set() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let scope = TestScope::new().await;
+
+    write_file(&scope, "data/obj.txt", b"conformance-body").await;
+
+    let secret = "test-shared-secret";
+    let (addr, _handle) = start_gateway_with_auth(&scope, secret).await;
+    let base = format!("http://{addr}/hdfs");
+    let http = HttpClient::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    // 1) UNSIGNED request is REJECTED when auth_secret is set (signature required).
+    let resp = http
+        .get(format!("{base}/data/obj.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "unsigned request must be rejected when auth_secret is set"
+    );
+    let xml = resp.text().await.unwrap();
+    assert!(
+        xml.contains("Signature is required") || xml.contains("AccessDenied"),
+        "unsigned rejection must require a signature: {xml}"
+    );
+
+    // 2) SIGNED request (correct secret) is accepted — normal default SigV4 flow.
+    let url = format!("{base}/data/obj.txt");
+    let headers = sign_v4_get("GET", &url, "any-access-key", secret, "us-east-1", "s3");
+    let mut req = http.get(&url);
+    // `aws-sigv4` signs `x-amz-content-sha256` but does not emit it; `s3s` requires it
+    // on the wire, so we add it alongside the signed Authorization headers.
+    req = req.header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.unwrap();
+    if resp.status() != 200 {
+        let body = resp.text().await.unwrap();
+        panic!("signed request with correct secret failed: {body}");
+    }
+    assert_eq!(
+        resp.status(),
+        200,
+        "signed request with correct secret must be accepted"
+    );
+    assert_eq!(&resp.bytes().await.unwrap()[..], b"conformance-body");
+
+    // 3) SIGNED request (WRONG secret) is rejected with SignatureDoesNotMatch.
+    let headers = sign_v4_get(
+        "GET",
+        &url,
+        "any-access-key",
+        "wrong-secret",
+        "us-east-1",
+        "s3",
+    );
+    let mut req = http.get(&url);
+    req = req.header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+    for (k, v) in headers {
+        req = req.header(&k, v);
+    }
+    let resp = req.send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "signed request with wrong secret must be rejected"
+    );
+    let xml = resp.text().await.unwrap();
+    assert!(
+        xml.contains("SignatureDoesNotMatch"),
+        "wrong-secret rejection must be SignatureDoesNotMatch: {xml}"
+    );
 }

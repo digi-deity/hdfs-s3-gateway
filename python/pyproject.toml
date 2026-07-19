@@ -18,6 +18,19 @@ repository = "https://github.com/your-org/s3hdfsgateway"
 
 [project.optional-dependencies]
 test = ["pytest"]
+parquet-engines = [
+    "polars",
+    "duckdb",
+    "pandas",
+    "pyarrow",
+    # s3fs < 2023.9 passes `endpoint_url` to `botocore.session.Session(**kwargs)`,
+    # which newer botocore rejects ("unexpected keyword argument 'endpoint_url'").
+    # Pin a version that routes endpoint_url through client_kwargs so the S3 clients
+    # can target the local gateway.
+    "s3fs>=2024.5.0",
+    "boto3>=1.34",
+    "fsspec>=2024.2.0",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

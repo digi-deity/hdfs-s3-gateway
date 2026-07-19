@@ -6,59 +6,38 @@
 //! "successful" response. This is the streaming-architecture risk, validated at
 //! the operational boundary: in-flight responses must be allowed to finish (or fail
 //! cleanly) on shutdown rather than being cut off mid-stream by process exit.
+//!
+//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use futures::StreamExt;
-use hdfs_native::minidfs::MiniDfs;
-use hdfs_native::{Client, ClientBuilder, WriteOptions};
-use hdfs_s3_gateway::config::Config;
+use hdfs_native::ClientBuilder;
 use hdfs_s3_gateway::s3::server::{build_service, serve};
 use hdfs_s3_gateway::s3::HdfsGateway;
 use reqwest::Client as HttpClient;
 use tokio::sync::Notify;
 
-/// Write a file directly via the HDFS client (we are not testing gateway writes — just
-/// seeding data for the read-under-shutdown test).
-async fn write_file(client: &Client, path: &str, data: &[u8]) {
-    let mut writer = client
-        .create(path, &WriteOptions::default().overwrite(true))
-        .await
-        .unwrap();
-    writer
-        .write_bytes(Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
-}
+mod common;
+use common::TestScope;
 
 #[tokio::test]
 async fn graceful_shutdown_drains_inflight_get() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
-    let hdfs = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let scope = TestScope::new().await;
 
     // A large file so the streamed GET takes a meaningful amount of time to deliver,
     // giving us a window in which to trigger shutdown mid-stream.
     let size: usize = 20 * 1024 * 1024; // 20 MiB
     let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    write_file(&hdfs, "/data/big.bin", &data).await;
+    scope.write_file("data/big.bin", &data).await;
 
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "127.0.0.1:0".to_string(),
-        max_concurrent_requests: 2048,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let config = scope.config();
+    let client = ClientBuilder::new()
+        .with_url(&config.namenode_uri)
+        .build()
+        .unwrap();
     let gateway = HdfsGateway::new(client, config.clone());
     let service = build_service(gateway, &config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -190,22 +169,14 @@ impl<'a> Visit for StringVisitor<'a> {
 #[tokio::test]
 async fn logging_request_id_correlated() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
-    let hdfs = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
-    write_file(&hdfs, "/data/obj.txt", b"logging-body").await;
+    let scope = TestScope::new().await;
+    scope.write_file("data/obj.txt", b"logging-body").await;
 
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "127.0.0.1:0".to_string(),
-        max_concurrent_requests: 2048,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let config = scope.config();
+    let client = ClientBuilder::new()
+        .with_url(&config.namenode_uri)
+        .build()
+        .unwrap();
     let gateway = HdfsGateway::new(client, config.clone());
     let service = build_service(gateway, &config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

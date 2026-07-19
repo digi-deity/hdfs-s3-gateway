@@ -36,6 +36,11 @@ jobs:
           tar -xf hadoop-3.5.0.tar.gz -C $GITHUB_WORKSPACE
           echo "$GITHUB_WORKSPACE/hadoop-3.5.0/bin" >> $GITHUB_PATH
 
+      - name: Install native libs and Maven
+        # Maven drives the MiniDFS Java harness; libkrb5/krb5-user are needed by the
+        # Kerberos integration paths the harness can exercise.
+        run: sudo apt-get update && sudo apt-get install -y maven libkrb5-dev krb5-user
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -45,11 +50,11 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Sync dependencies
-        # Install the `test` extra so `pytest` (the only third-party test dependency,
-        # declared under [project.optional-dependencies]) is present for `uv run pytest`.
-        # `uv sync` does NOT install optional extras by default, which is why pytest was
-        # missing and the suite failed to run.
-        run: uv sync --extra test
+        # Install the `test` extra (pytest) and the `parquet-engines` extra (polars,
+        # duckdb, pandas, pyarrow, s3fs) — the latter is required by
+        # python/tests/test_parquet_engines.py, which imports those engines at module
+        # top level. `uv sync` does NOT install optional extras by default.
+        run: uv sync --extra test --extra parquet-engines
 
       - uses: PyO3/maturin-action@v1
         with:
@@ -59,9 +64,48 @@ jobs:
           container: 'off'
           working-directory: ./python
 
+      - name: Start MiniDFS and seed HDFS
+        # The parquet-engine tests read a hive-partitioned table from a real MiniDFS
+        # cluster. We generate the harness (written by hdfs-native's build.rs only when
+        # its `integration-test` feature is compiled), launch it in the background, wait
+        # for its "Ready!" line, then seed the partitioned parquet.
+        working-directory: ${{ github.workspace }}
+        run: |
+          cargo test --lib -p hdfs-s3-gateway --no-run --features hdfs-native/integration-test
+          HARNESS=$(ls -d target/debug/build/hdfs-native-*/out/minidfs | head -1)
+          echo "MiniDFS harness: $HARNESS"
+
+          # The harness blocks on stdin (readLine) after printing "Ready!", so we keep
+          # a held-open pipe as its stdin to stop it from exiting immediately.
+          mkfifo /tmp/minidfs_stdin
+          sleep 100000 > /tmp/minidfs_stdin &
+          echo $! > /tmp/minidfs_stdin_holder.pid
+
+          mvn -q compile exec:java -f "$HARNESS/pom.xml" < /tmp/minidfs_stdin > /tmp/minidfs.log 2>&1 &
+          echo $! > /tmp/minidfs.pid
+
+          for i in $(seq 1 90); do
+            if grep -q "Ready!" /tmp/minidfs.log; then echo "MiniDFS ready"; break; fi
+            sleep 2
+          done
+          if ! grep -q "Ready!" /tmp/minidfs.log; then
+            echo "MiniDFS failed to start:"; cat /tmp/minidfs.log; exit 1
+          fi
+
+          export HADOOP_CONF_DIR=$PWD/target/test
+          uv run --project python python scripts/experiment_parquet.py seed
+
       - name: Run tests
         run: |
+          export HADOOP_CONF_DIR=$PWD/target/test
           uv run pytest
+
+      - name: Stop MiniDFS
+        if: always()
+        run: |
+          [ -f /tmp/minidfs.pid ] && kill "$(cat /tmp/minidfs.pid)" 2>/dev/null || true
+          [ -f /tmp/minidfs_stdin_holder.pid ] && kill "$(cat /tmp/minidfs_stdin_holder.pid)" 2>/dev/null || true
+          rm -f /tmp/minidfs_stdin
 
   build:
     runs-on: ubuntu-latest

@@ -67,6 +67,7 @@ fast at startup.
 | `hdfs_options` | — | — | `{}` | Free-form `HashMap<String,String>` → `hdfs-native` `ClientBuilder::with_config` (raw Hadoop keys; **override** XML) |
 | `hdfs_config_dir` | — | — | `None` | Optional → `with_config_dir`; **replaces** `HADOOP_CONF_DIR`/`HADOOP_HOME` fallback when set |
 | `hdfs_user` | — | — | `None` | Optional → `with_user`; else `HADOOP_USER_NAME`/`HADOOP_PROXY_USER` |
+| `auth_secret` | `AUTH_SECRET` | `--auth-secret` | `None` | Optional shared secret. When **unset** (default), the gateway accepts **both** anonymous and any signed request. When **set**, a valid SigV4 signature is **required** (unsigned → `403`, wrong secret → `403 SignatureDoesNotMatch`). Not user identity — a shared password. |
 
 Example `config.toml`:
 
@@ -189,6 +190,61 @@ actually-bound address, once running), `is_running`, `start()`, `stop()`, and
 > gracefully on interpreter exit (best-effort drain). For guaranteed clean shutdown, prefer
 > `serving(...)` or an explicit `stop()`.
 
+### Reading data through the gateway
+
+Once the gateway is running, point any S3 client at its endpoint. The examples below assume
+`hdfs_root="/data"`, `bucket_name="hdfs"`, and a hive-partitioned table at
+`s3://hdfs/seed_parquet/country=us/year=2021/data.parquet`. By default the gateway has no
+auth, so clients use **anonymous / unsigned** access; the endpoint is `http://<gw.address>`.
+If you set `auth_secret`, clients can instead sign normally (any access-key id + that secret)
+and drop the `anonymous` / `aws_skip_signature` flags.
+
+**polars** — directory tree or recursive glob (polars expands the glob client-side):
+
+```python
+import polars as pl
+ep = f"http://{gw.address}"
+so = {"aws_skip_signature": "true", "aws_endpoint_url": ep, "aws_allow_http": "true"}
+df = pl.read_parquet("s3://hdfs/seed_parquet/", storage_options=so)
+df = pl.read_parquet("s3://hdfs/seed_parquet/country=*/year=*/*.parquet", storage_options=so)
+```
+
+**DuckDB** — httpfs reads a directory tree via a recursive glob (`**`):
+
+```python
+import duckdb
+host = f"http://{gw.address}".replace("http://", "")
+duckdb.sql("INSTALL httpfs; LOAD httpfs;")
+duckdb.sql(f"SET s3_endpoint='{host}'; SET s3_use_ssl=false;")
+duckdb.sql("SET s3_access_key_id=''; SET s3_secret_access_key=''; SET s3_session_token='';")
+duckdb.sql("SET s3_url_style='path';")
+df = duckdb.sql("SELECT * FROM read_parquet('s3://hdfs/seed_parquet/**')").df()
+```
+
+**pandas** (pyarrow or s3fs engine) — delegates `s3://` to fsspec/s3fs, so use the
+anonymous + endpoint options and the directory form:
+
+```python
+import pandas as pd
+ep = f"http://{gw.address}"
+so = {"anon": "true", "endpoint_url": ep, "client_kwargs": {"endpoint_url": ep}}
+df = pd.read_parquet("s3://hdfs/seed_parquet/", storage_options=so)
+```
+
+**pyarrow** (native `S3FileSystem`) — wants a `bucket/key` path, not a full `s3://` URI:
+
+```python
+import pyarrow.dataset as ds, pyarrow.fs as pafs
+host = f"http://{gw.address}".replace("http://", "")
+s3 = pafs.S3FileSystem(anonymous=True, endpoint_override=host, scheme="http")
+table = ds.dataset("hdfs/seed_parquet", format="parquet", filesystem=s3, partitioning="hive").to_table()
+```
+
+> **Path-form notes.** Only polars and DuckDB expand glob patterns (`country=*/year=*`)
+> client-side into real S3 listings; the other engines pass the glob literally to the
+> gateway, which cannot match it. For a whole partitioned table, use the directory form
+> (`s3://hdfs/seed_parquet/`).
+
 ### Logging
 
 By default the gateway is **silent** — it emits no logs and never writes to Python's
@@ -243,8 +299,13 @@ interpreter at shutdown.
 
 ## Testing
 
-Integration tests spin up a real `MiniDFSCluster` via `hdfs-native`'s `minidfs` feature, which
-requires a JVM 17+, Maven, and Hadoop binaries on `PATH`:
+Integration tests require a **pre-started HDFS cluster** (e.g. a `MiniDFSCluster` launched in
+bash before the tests run — the same approach as the Python CI). The endpoint is read from
+`HDFS_NAMENODE_URI` (default `hdfs://127.0.0.1:9000`). The tests no longer spawn a cluster
+from within Rust; each test isolates its fixtures under a unique HDFS root that is deleted on
+cleanup, so the test binaries can run in parallel against the shared cluster.
+
+Prerequisites to run the cluster (JVM 17+, Maven, Hadoop on `PATH`):
 
 - Java 17 (matches the version validated by the upstream `hdfs-native` project)
 - `JAVA_HOME` pointing to the JDK (set automatically by `actions/setup-java` in CI)
@@ -257,21 +318,27 @@ export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64   # or wherever JDK 17 lives
 export HADOOP_HOME=/opt/hadoop-3.4.2
 export PATH=$PATH:$HADOOP_HOME/bin
 
+# Start a MiniDFSCluster once (in the background), then point the tests at it.
+cargo test --lib --no-run
+HARNESS=$(ls -d target/debug/build/hdfs-native-*/out/minidfs | head -1)
+mvn -q compile exec:java -f "$HARNESS/pom.xml" > /tmp/minidfs.log 2>&1 &
+# wait for the "Ready!" line in /tmp/minidfs.log, then:
+export HDFS_NAMENODE_URI=hdfs://127.0.0.1:9000
+
 # Unit tests (no cluster needed)
 cargo test --lib
 
-# Integration tests — MUST run single-threaded; MiniDFSCluster hardcodes its work dir
-rm -rf target/test
-cargo test --test integration -- --test-threads=1
+# Integration tests — share the cluster above; fixtures are isolated + cleaned up per test.
+# The binaries run in parallel; within a binary we serialize (--test-threads=1) because the
+# large-dir listing case dominates the wall time and runs alone anyway.
+cargo test --test integration --test conformance --test graceful_shutdown \
+           --test backpressure_test --test load -- --test-threads=1
 ```
-
-> **Why `--test-threads=1`:** the MiniDFSCluster harness hardcodes `target/test` as its work
-> directory, so parallel test binaries clobber each other's `dfs/name-*` dirs. Run serially and
-> clean the work dir between runs.
 
 Test layout:
 
 - `src/core` / `src/config` — pure unit tests (path mapping, range math, config).
+- `tests/common/mod.rs` — shared harness: cluster endpoint + per-test isolated HDFS root.
 - `tests/integration.rs` — end-to-end against MiniDFS (head/get/list/write-denied).
 - `tests/load.rs` — concurrent-read throughput scaling.
 - `tests/backpressure_test.rs` — `503 SlowDown` under load.
@@ -283,8 +350,8 @@ Test layout:
 
 ## ⚠️ Security posture
 
-**This service performs NO authentication or authorization.** It does not validate the
-`Authorization` header, SigV4 query parameters, or anything else — requests are accepted
+**By default this service performs NO authentication or authorization.** It does not validate
+the `Authorization` header, SigV4 query parameters, or anything else — requests are accepted
 whether or not they carry credentials, and access is never denied for auth reasons.
 
 **Consequence: anyone with network access to this service can read all exposed HDFS data.**
@@ -300,10 +367,39 @@ a data breach. You MUST place it behind network-level access control:
 rate limiting, and backpressure are the integrator's responsibility (implemented here in
 `backpressure.rs`). None of that substitutes for network-level access control.
 
+### Optional SigV4 auth (`auth_secret`)
+
+`auth_secret` is **optional** (CLI `--auth-secret`, env `AUTH_SECRET`, or TOML `auth_secret`).
+There is **no default** — it is unset unless you configure it.
+
+- **When `auth_secret` is unset (default):** the gateway configures no auth provider, so it
+  accepts **both** anonymous requests **and** any signed request (the original no-auth
+  behavior). This is the default because the gateway is meant to sit behind network access
+  control / a reverse proxy.
+- **When `auth_secret` is set:** a valid SigV4 signature becomes **required**. Unsigned
+  requests are rejected with `403 AccessDenied` ("Signature is required"), and signed requests
+  are verified against the shared secret — a bad signature is rejected with
+  `403 SignatureDoesNotMatch`.
+
+The gateway does **not** map the access-key id to a user — it only checks that a signed
+request knew the shared secret. So this is a shared password, **not** per-user identity, and
+it provides **no confidentiality** on its own (the channel is still plaintext HTTP). Its value
+is that standard AWS SDKs can use their normal default signing flow (any access-key id + this
+secret) instead of the `anonymous` / `aws_skip_signature` flags, and that unsigned access is
+closed off when you want it to be.
+
+> **This is not real security.** Without TLS in front, the `Authorization` header (and data)
+> is sniffable, so the signing only proves the client held the secret at some point. For any
+> real confidentiality, terminate TLS at a reverse proxy and treat `auth_secret` as a bonus
+> that removes client-side signing flags — not as a substitute for network access control.
+
 ### TLS
 
 There is **no TLS termination in this service**. Terminate TLS at a reverse proxy / load
-balancer in front of it; do not add TLS handling inside the gateway.
+balancer in front of it; do not add TLS handling inside the gateway. A self-signed cert there
+is rejected by default by clients such as polars/pyarrow/boto3 (they need `verify=False` or a
+`ca_bundle`), so prefer a publicly-trusted cert (e.g. Caddy / Let's Encrypt) so clients work
+with zero configuration.
 
 ### Upstream error exposure (`expose_upstream_errors`)
 
