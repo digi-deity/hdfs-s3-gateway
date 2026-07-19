@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.1,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hdfs-s3-gateway"
+description = "Python bindings for the HDFS → S3 read-only gateway"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.urls]
+repository = "https://github.com/your-org/s3hdfsgateway"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "hdfs_s3_gateway._internal"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

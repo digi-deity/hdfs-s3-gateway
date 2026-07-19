@@ -1,0 +1,140 @@
+name: rust-test
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "*"
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Format
+        run: cargo fmt -- --check
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check (no default features)
+        run: cargo check --tests
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+  test-integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -C debuginfo=1
+      RUST_BACKTRACE: "1"
+      RUST_LOG: debug
+      # HADOOP_HOME is set here so every run: step inherits it without repetition.
+      # The directory name matches what the lean tarball extracts to (hadoop-3.4.2/).
+      HADOOP_HOME: ${{ github.workspace }}/hadoop-3.4.2
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install minimal stable with clippy and rustfmt
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install native libs
+        # maven is needed by MiniDfs::with_features to compile and launch the
+        # embedded MiniDFSCluster Java harness; libkrb5-dev/krb5-user are needed
+        # for the Kerberos integration paths and for building the krb5 Rust crate.
+        run: sudo apt-get install -y libkrb5-dev krb5-user maven
+
+      - name: Set up JDK
+        # Use Java 17, matching the version validated by the upstream hdfs-native
+        # project for MiniDFS integration tests.
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Download Hadoop
+        # Use Hadoop 3.4.2-lean to match the version validated by the upstream
+        # hdfs-native project.  The lean tarball extracts to hadoop-3.4.2/.
+        run: |
+          wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.4.2/hadoop-3.4.2-lean.tar.gz
+          tar -xf hadoop-3.4.2-lean.tar.gz -C $GITHUB_WORKSPACE
+          echo "$GITHUB_WORKSPACE/hadoop-3.4.2/bin" >> $GITHUB_PATH
+
+      - name: Verify Java/Hadoop/Maven tooling
+        # Confirm all prerequisites are visible before spending time on a Cargo build.
+        run: |
+          java -version
+          mvn --version
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "HADOOP_HOME=$HADOOP_HOME"
+          ls "$HADOOP_HOME/bin/hdfs"
+
+      # Each MiniDfs-backed integration test file spins up its own Hadoop
+      # MiniDFSCluster, which writes to the *same* hardcoded `target/test/data/dfs`
+      # directory. Running two such clusters concurrently makes their NameNode/DataNode
+      # storage dirs collide and the cluster fails to start. We therefore run every
+      # MiniDfs-backed test file as its own `cargo test --test <file> -- --test-threads=1`
+      # step, sequentially (never in parallel), with a clean `target/test` before each.
+      #
+      # NOTE: `--test-threads=1` only serializes *across test functions within a file*;
+      # the concurrency each test exercises (many concurrent request tasks on the
+      # gateway's own Tokio runtime) is unaffected and remains genuine.
+      - name: Run integration tests (integration)
+        run: |
+          rm -rf target/test
+          cargo test --test integration -- --test-threads=1
+
+      - name: Run integration tests (conformance)
+        run: |
+          rm -rf target/test
+          cargo test --test conformance -- --test-threads=1
+
+      - name: Run integration tests (graceful_shutdown)
+        run: |
+          rm -rf target/test
+          cargo test --test graceful_shutdown -- --test-threads=1
+
+      - name: Run integration tests (backpressure_test)
+        run: |
+          rm -rf target/test
+          cargo test --test backpressure_test -- --test-threads=1
+
+      # Concurrency/throughput hardening. Slower and noisier than the others, so it gets
+      # its own step with a longer timeout. Still single-threaded at the Cargo level for
+      # the same MiniDfs-dir-collision reason; the 64-way request concurrency it asserts
+      # is real (spawned inside the test on the gateway's runtime).
+      - name: Run integration tests (load)
+        timeout-minutes: 20
+        run: |
+          rm -rf target/test
+          cargo test --test load -- --test-threads=1

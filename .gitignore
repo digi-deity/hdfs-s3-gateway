@@ -1,0 +1,91 @@
+# ===== Rust =====
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed for binaries but ignored for libraries.
+# This project produces both a binary and a library/Python extension,
+# so we keep Cargo.lock tracked to ensure reproducible builds.
+# If you prefer to ignore it, uncomment the next line:
+# Cargo.lock
+
+# ===== Python =====
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions / build artifacts
+*.so
+*.pyd
+*.dylib
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+
+# ===== Maturin / PyO3 build artifacts =====
+# maturin places compiled extension modules and metadata here
+python/hdfs_s3_gateway/*.so
+python/hdfs_s3_gateway/*.pyd
+python/hdfs_s3_gateway/*.dylib
+
+# ===== Editor / IDE =====
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+*.swp
+*.swo
+*~
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== Local test / runtime data =====
+# Generated test data and local config overrides
+test/data/
+*.local.xml
+.env
+.env.local
+
+# ===== Logs =====
+*.log
+logs/

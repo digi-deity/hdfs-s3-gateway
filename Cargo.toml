@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = ["python"]
+
+[package]
+name = "hdfs-s3-gateway"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Expose an HDFS cluster as a read-only S3-compatible endpoint"
+repository = "https://github.com/your-org/s3hdfsgateway"
+
+[lib]
+name = "hdfs_s3_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hdfs-s3-gateway"
+path = "src/main.rs"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.74"
+
+[workspace.dependencies]
+# S3 protocol layer (published crates)
+s3s = "0.14.1"
+
+# HDFS client (published crate)
+hdfs-native = "0.14.2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP server (hyper via s3s)
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "http1", "tokio"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Misc
+async-trait = "0.1"
+bytes = "1"
+mime_guess = "2"
+base64 = "0.22"
+
+# Matches s3s's `http-body` version; used to wrap response bodies so the
+# backpressure permit is held until the body is fully streamed.
+http-body = "1.0.1"
+
+[dependencies]
+s3s = { workspace = true }
+hdfs-native = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hyper-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+mime_guess = { workspace = true }
+base64 = { workspace = true }
+http-body = { workspace = true }
+http = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+hdfs-native = { workspace = true, features = ["integration-test"] }
