@@ -4,7 +4,7 @@ members = ["python"]
 
 [package]
 name = "hdfs-s3-gateway"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 rust-version = "1.74"
 
 [workspace.dependencies]
