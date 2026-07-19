@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::s3::auth::SharedSecretAuth;
 use crate::s3::HdfsGateway;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -25,9 +26,18 @@ pub fn build_service(gateway: HdfsGateway, config: &Config) -> BackpressureServi
     s3_config.form_max_fields_size = 20 * 1024 * 1024; // 20 MiB
     s3_config.form_max_parts = 1000;
 
-    // No `set_auth` → no SigV4 verification.
+    // When `auth_secret` is configured, enable SigV4 signature verification. We do NOT
+    // set a custom access policy, so `s3s` applies its default check: unsigned requests
+    // are rejected ("Signature is required") and signed requests are verified against the
+    // shared secret (bad signatures → 403 SignatureDoesNotMatch). We never identify the
+    // user — the gateway only cares that a signed request knew the secret. When
+    // `auth_secret` is absent (default), no auth provider is set and the gateway accepts
+    // BOTH anonymous and any signed request (the original no-auth behavior).
     let mut builder = S3ServiceBuilder::new(gateway);
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
+    if let Some(secret) = &config.auth_secret {
+        builder.set_auth(SharedSecretAuth::new(secret.clone()));
+    }
     let service = builder.build();
 
     BackpressureService::new(service, config.max_concurrent_requests)

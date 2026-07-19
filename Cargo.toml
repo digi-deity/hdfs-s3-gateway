@@ -4,7 +4,7 @@ members = ["python"]
 
 [package]
 name = "hdfs-s3-gateway"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -89,4 +89,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 [dev-dependencies]
 env_logger = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-hdfs-native = { workspace = true, features = ["integration-test"] }
+hdfs-native = { workspace = true }
+aws-sigv4 = "1"
+aws-credential-types = "1"
+aws-smithy-runtime-api = "1"

@@ -11,20 +11,19 @@
 //! Under true parallelism they take ~the single-read time. We assert the concurrent time stays
 //! far below the serialized bound.
 //!
-//! Requires `mvn` + JDK on PATH (MiniDfs harness). Run serially with a clean `target/test`.
+//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow).
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use hdfs_native::minidfs::MiniDfs;
-use hdfs_native::{Client, ClientBuilder, WriteOptions};
-use hdfs_s3_gateway::config::Config;
+use hdfs_native::ClientBuilder;
 use hdfs_s3_gateway::s3::server::{build_service, serve};
 use hdfs_s3_gateway::s3::HdfsGateway;
 
-use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::Client as HttpClient;
+
+mod common;
+use common::TestScope;
 
 /// Client read rate we throttle to (bytes/sec). The client is the bottleneck, so transfer time
 /// is deterministic regardless of CI runner speed.
@@ -32,23 +31,16 @@ const THROTTLE_BYTES_PER_SEC: f64 = 1.0 * 1024.0 * 1024.0; // 1 MiB/s
 
 /// Start the gateway on an ephemeral port and return the bound address + a shutdown trigger.
 async fn start_gateway(
-    dfs: &MiniDfs,
+    scope: &TestScope,
 ) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<std::io::Result<()>>,
 ) {
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "127.0.0.1:0".to_string(),
-        max_concurrent_requests: 2048,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let config = scope.config();
+    let client = ClientBuilder::new()
+        .with_url(&config.namenode_uri)
+        .build()
+        .unwrap();
     let gateway = HdfsGateway::new(client, config.clone());
     let service = build_service(gateway, &config);
 
@@ -58,18 +50,6 @@ async fn start_gateway(
     // `std::future::pending()` never resolves, so the server runs until the task is aborted.
     let handle = tokio::spawn(serve(listener, service, std::future::pending()));
     (addr, handle)
-}
-
-async fn write_file(client: &Client, path: &str, data: &[u8]) {
-    let mut writer = client
-        .create(path, &WriteOptions::default().overwrite(true))
-        .await
-        .unwrap();
-    writer
-        .write_bytes(Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
 }
 
 /// Read `url` fully, consuming bytes at `THROTTLE_BYTES_PER_SEC` by sleeping proportionally to
@@ -120,14 +100,13 @@ async fn hammer_throttled(
 #[tokio::test]
 async fn concurrent_reads_scale() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
-    let hdfs = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let scope = TestScope::new().await;
 
     // A 1 MiB file. At our 1 MiB/s throttle a single read should take ~1s.
     let medium: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    write_file(&hdfs, "/data/medium.bin", &medium).await;
+    scope.write_file("data/medium.bin", &medium).await;
 
-    let (addr, _handle) = start_gateway(&dfs).await;
+    let (addr, _handle) = start_gateway(&scope).await;
     let base = format!("http://{addr}/hdfs");
     let http = HttpClient::new();
 

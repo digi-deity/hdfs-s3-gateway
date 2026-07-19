@@ -2,18 +2,17 @@
 //! harness `hdfs-native` uses for its own tests). These exercise OUR usage of the
 //! client — not HDFS itself.
 //!
-//! Requires `mvn` and a JDK on PATH (the MiniDfs harness shells out to Maven). The
-//! `integration-test` feature on `hdfs-native` enables `hdfs_native::minidfs::MiniDfs`.
+//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow,
+//! which launches MiniDFSCluster in bash before running `cargo test`). The endpoint is
+//! read from `HDFS_NAMENODE_URI` (default `hdfs://127.0.0.1:9000`).
 
-use std::collections::HashSet;
-
-use bytes::Bytes;
-use hdfs_native::minidfs::MiniDfs;
-use hdfs_native::{Client, ClientBuilder, WriteOptions};
-use hdfs_s3_gateway::config::Config;
+use hdfs_native::Client;
 use hdfs_s3_gateway::s3::HdfsGateway;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3};
+
+mod common;
+use common::TestScope;
 
 /// Build an `S3Request` carrying only the operation input (no HTTP context needed for
 /// direct trait calls in tests).
@@ -31,64 +30,38 @@ fn req<T>(input: T) -> S3Request<T> {
     }
 }
 
-/// Stand up a MiniDFSCluster and return it plus a gateway wired to it. The same
-/// `Client` is returned so tests write through the exact instance the gateway uses.
-fn setup() -> (MiniDfs, HdfsGateway, Client) {
+/// Stand up a gateway wired to the shared cluster, isolated under a unique HDFS root.
+/// The same `Client` is returned so tests write through the exact instance the gateway uses.
+async fn setup() -> (TestScope, HdfsGateway, Client) {
     let _ = env_logger::builder().is_test(true).try_init();
-    let dfs = MiniDfs::with_features(&HashSet::new());
-
-    let config = Config {
-        namenode_uri: dfs.url.clone(),
-        hdfs_root: "/".to_string(),
-        bucket_name: "hdfs".to_string(),
-        listen_addr: "0.0.0.0:0".to_string(),
-        max_concurrent_requests: 64,
-        expose_upstream_errors: false,
-        hdfs_options: Default::default(),
-        hdfs_config_dir: None,
-        hdfs_user: None,
-    };
-
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
-    let gateway = HdfsGateway::new(client.clone(), config);
-    (dfs, gateway, client)
-}
-
-/// Write a file directly via the HDFS client (we are not testing writes through the
-/// gateway — it's read-only — just seeding data for read tests).
-async fn write_file(client: &hdfs_native::Client, path: &str, data: &[u8]) {
-    let mut writer = client
-        .create(path, &WriteOptions::default().overwrite(true))
-        .await
-        .unwrap();
-    writer
-        .write_bytes(Bytes::copy_from_slice(data))
-        .await
-        .unwrap();
-    writer.close().await.unwrap();
+    let scope = TestScope::new().await;
+    let client = scope.client.clone();
+    let gateway = HdfsGateway::new(client.clone(), scope.config());
+    (scope, gateway, client)
 }
 
 #[tokio::test]
 async fn hello_world_minidfs() {
     // Prove we can talk to a real cluster and read a file back.
-    let dfs = MiniDfs::with_features(&HashSet::new());
-    let client = ClientBuilder::new().with_url(&dfs.url).build().unwrap();
+    let scope = TestScope::new().await;
+    let client = scope.client.clone();
 
-    write_file(&client, "/hello.txt", b"hello hdfs").await;
+    scope.write_file("data/hello.txt", b"hello hdfs").await;
 
-    let status = client.get_file_info("/hello.txt").await.unwrap();
+    let hello_path = format!("{}/data/hello.txt", scope.root);
+    let status = client.get_file_info(&hello_path).await.unwrap();
     assert!(!status.isdir);
     assert_eq!(status.length, 10);
 
-    let mut reader = client.read("/hello.txt").await.unwrap();
+    let mut reader = client.read(&hello_path).await.unwrap();
     let buf = reader.read_bytes(1024).await.unwrap();
     assert_eq!(&buf[..], b"hello hdfs");
 }
 
 #[tokio::test]
 async fn head_object_and_bucket() {
-    let (_dfs, gateway, client) = setup();
-    write_file(&client, "/data/a/b.txt", b"contents").await;
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/a/b.txt", b"contents").await;
 
     // head_bucket for the configured bucket → 200
     let resp = gateway
@@ -126,7 +99,7 @@ async fn head_object_and_bucket() {
     assert!(out.output.e_tag.is_some());
 
     // head_object on a directory → NoSuchKey
-    write_file(&client, "/data/dir/file.txt", b"x").await;
+    _scope.write_file("data/dir/file.txt", b"x").await;
     let err = gateway
         .head_object(req(HeadObjectInput {
             bucket: "hdfs".into(),
@@ -151,8 +124,8 @@ async fn head_object_and_bucket() {
 
 #[tokio::test]
 async fn path_traversal_blocked() {
-    let (_dfs, gateway, client) = setup();
-    write_file(&client, "/secret.txt", b"topsecret").await;
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/secret.txt", b"topsecret").await;
 
     // A traversal key must not resolve to /secret.txt
     let err = gateway
@@ -168,11 +141,11 @@ async fn path_traversal_blocked() {
 
 #[tokio::test]
 async fn list_objects_v2() {
-    let (_dfs, gateway, client) = setup();
-    write_file(&client, "/data/a/b/c.txt", b"1").await;
-    write_file(&client, "/data/a/b/d.txt", b"2").await;
-    write_file(&client, "/data/a/e.txt", b"3").await;
-    write_file(&client, "/data/f.txt", b"4").await;
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/a/b/c.txt", b"1").await;
+    _scope.write_file("data/a/b/d.txt", b"2").await;
+    _scope.write_file("data/a/e.txt", b"3").await;
+    _scope.write_file("data/f.txt", b"4").await;
 
     // No prefix/delimiter → all objects recursively
     let resp = gateway
@@ -223,15 +196,15 @@ async fn list_objects_v2_prefix_pagination_and_order() {
     // Prefix filtering, max-keys pagination with continuation-token
     // round-trip, deeply-nested single CommonPrefix collapse, and strict binary-lexicographic
     // ordering — all driven through the real `s3s` trait (HTTP-shaped, no HTTP server needed).
-    let (_dfs, gateway, client) = setup();
+    let (_scope, gateway, _client) = setup().await;
 
     // A small tree under /data/list/.
-    write_file(&client, "/data/list/a.txt", b"a").await;
-    write_file(&client, "/data/list/b.txt", b"b").await;
-    write_file(&client, "/data/list/sub/c.txt", b"c").await;
-    write_file(&client, "/data/list/sub/d.txt", b"d").await;
-    write_file(&client, "/data/list/sub/deep/e.txt", b"e").await;
-    write_file(&client, "/data/list2/x.txt", b"x").await;
+    _scope.write_file("data/list/a.txt", b"a").await;
+    _scope.write_file("data/list/b.txt", b"b").await;
+    _scope.write_file("data/list/sub/c.txt", b"c").await;
+    _scope.write_file("data/list/sub/d.txt", b"d").await;
+    _scope.write_file("data/list/sub/deep/e.txt", b"e").await;
+    _scope.write_file("data/list2/x.txt", b"x").await;
 
     // --- prefix filtering -------------------------------------------------------
     let resp = gateway
@@ -332,7 +305,7 @@ async fn list_objects_v2_prefix_pagination_and_order() {
     // --- strict binary-lexicographic ordering ------------------------------------
     // Keys must be sorted by raw byte order, not locale/collation. Insert a key with a
     // byte that sorts after lowercase letters (e.g. '~') to confirm byte order.
-    write_file(&client, "/data/list/~z.txt", b"z").await;
+    _scope.write_file("data/list/~z.txt", b"z").await;
     let resp = gateway
         .list_objects_v2(req(ListObjectsV2Input {
             bucket: "hdfs".into(),
@@ -363,10 +336,12 @@ async fn list_objects_v2_large_dir() {
     // A directory with many thousands of entries must list completely
     // and return every key exactly once. This also surfaces whether `hdfs-native`'s listing
     // returns everything in one shot (it does per docs) rather than paginating internally.
-    let (_dfs, gateway, client) = setup();
+    let (_scope, gateway, _client) = setup().await;
     let n: usize = 3000;
     for i in 0..n {
-        write_file(&client, &format!("/data/bigdir/file_{i:05}.bin"), b"x").await;
+        _scope
+            .write_file(&format!("data/bigdir/file_{i:05}.bin"), b"x")
+            .await;
     }
 
     let start = std::time::Instant::now();
@@ -412,11 +387,11 @@ async fn list_objects_v2_large_dir() {
 
 #[tokio::test]
 async fn get_object_full_and_ranged() {
-    let (_dfs, gateway, client) = setup();
+    let (_scope, gateway, _client) = setup().await;
 
     // A 1 MiB file of a repeating pattern.
     let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    write_file(&client, "/data/big.bin", &data).await;
+    _scope.write_file("data/big.bin", &data).await;
 
     // Full GET → body bytes match exactly, correct Content-Length.
     let resp = gateway
@@ -501,7 +476,7 @@ async fn get_object_full_and_ranged() {
     assert!(format!("{err:?}").contains("InvalidRange"));
 
     // get_object on a directory → NoSuchKey.
-    write_file(&client, "/data/dir/file.txt", b"x").await;
+    _scope.write_file("data/dir/file.txt", b"x").await;
     let err = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
@@ -515,8 +490,8 @@ async fn get_object_full_and_ranged() {
 
 #[tokio::test]
 async fn get_object_conditionals() {
-    let (_dfs, gateway, client) = setup();
-    write_file(&client, "/data/c.txt", b"conditional").await;
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/c.txt", b"conditional").await;
 
     // Capture the ETag from head_object.
     let head = gateway
@@ -594,8 +569,8 @@ fn assert_access_denied<T: std::fmt::Debug>(res: s3s::S3Result<T>) {
 async fn write_ops_uniformly_denied() {
     // Every write-shaped operation returns a uniform AccessDenied, regardless of
     // whether the target exists. We seed a file so existence is not the deciding factor.
-    let (_dfs, gateway, client) = setup();
-    write_file(&client, "/data/w.txt", b"x").await;
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/w.txt", b"x").await;
 
     // Object-level writes.
     assert_access_denied(
@@ -735,7 +710,7 @@ async fn write_ops_uniformly_denied() {
 #[tokio::test]
 async fn bucket_config_probes_not_configured() {
     // Bucket-config probes answer the way real S3 would on a fresh bucket.
-    let (_dfs, gateway, _client) = setup();
+    let (_scope, gateway, _client) = setup().await;
 
     // Versioning → disabled (empty status).
     let out = gateway

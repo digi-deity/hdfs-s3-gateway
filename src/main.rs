@@ -1,8 +1,9 @@
 //! Binary entry point: wires config → HDFS client → `HdfsGateway` → `s3s` service →
-//! hyper server. Auth verification is intentionally NOT enabled: `s3s` defaults to
-//! no auth, so we simply do not call `set_auth`. This means ANYONE with network access
-//! can read all exposed HDFS data — the service MUST run behind network-level access
-//! control (see README / ops docs).
+//! hyper server. Auth is OPTIONAL: when `auth_secret` is set, signed requests are
+//! verified (bad signatures rejected) while unsigned requests are still accepted; when
+//! unset, `s3s` defaults to no auth and all requests are accepted. Either way the service
+//! runs over plaintext HTTP and MUST sit behind network-level access control and (for any
+//! real confidentiality) a TLS-terminating reverse proxy (see README / ops docs).
 
 use std::net::SocketAddr;
 
@@ -34,12 +35,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gateway = HdfsGateway::from_config(&config)?;
     info!(namenode = %config.namenode_uri, "connected to HDFS NameNode");
 
-    // Build the S3 service (no auth) wrapped in the concurrency backpressure layer.
+    // Build the S3 service (optional auth) wrapped in the concurrency backpressure layer.
     let service = server::build_service(gateway, &config);
 
     let addr: SocketAddr = config.listen_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(%addr, "gateway listening (NO AUTH — must be behind network access control)");
+    match &config.auth_secret {
+        Some(_) => {
+            info!(%addr, "gateway listening (optional SigV4 auth — signed verified, unsigned accepted; must be behind TLS + network access control)")
+        }
+        None => info!(%addr, "gateway listening (NO AUTH — must be behind network access control)"),
+    }
 
     // Serve until SIGTERM/SIGINT, then gracefully drain in-flight connections.
     server::serve(listener, service, async {

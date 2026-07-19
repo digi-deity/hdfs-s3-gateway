@@ -231,13 +231,14 @@ struct Gateway {
 #[pymethods]
 impl Gateway {
     #[new]
-    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, log_level=None, log_to=None))]
+    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, auth_secret=None, log_level=None, log_to=None))]
     fn new(
         config_path: Option<PathBuf>,
         namenode_uri: Option<String>,
         hdfs_root: Option<String>,
         bucket_name: Option<String>,
         listen_addr: Option<String>,
+        auth_secret: Option<String>,
         log_level: Option<String>,
         log_to: Option<String>,
     ) -> PyResult<Self> {
@@ -247,6 +248,7 @@ impl Gateway {
             namenode_uri,
             hdfs_root,
             bucket_name,
+            auth_secret,
         };
         let config = Config::load(&args)
             .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e}")))?;
