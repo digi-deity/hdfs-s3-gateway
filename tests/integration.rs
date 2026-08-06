@@ -6,7 +6,10 @@
 //! which launches MiniDFSCluster in bash before running `cargo test`). The endpoint is
 //! read from `HDFS_NAMENODE_URI` (default `hdfs://127.0.0.1:9000`).
 
+use std::time::{Duration, SystemTime};
+
 use hdfs_native::Client;
+use hdfs_native::ClientBuilder;
 use hdfs_s3_gateway::s3::HdfsGateway;
 use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3};
@@ -332,6 +335,146 @@ async fn list_objects_v2_prefix_pagination_and_order() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_prefix_with_delimiter() {
+    // The most common real-world listing shape: `prefix=<dir>/&delimiter=/`. The
+    // directory portion of the prefix is pushed down to HDFS, and the delimiter
+    // collapses the next level into CommonPrefixes.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/list/a.txt", b"a").await;
+    _scope.write_file("data/list/sub/b.txt", b"b").await;
+    _scope.write_file("data/list/sub/deep/c.txt", b"c").await;
+    _scope.write_file("data/other/d.txt", b"d").await;
+
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/list/".into()),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let contents: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    let prefixes: Vec<String> = resp
+        .common_prefixes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.prefix.unwrap())
+        .collect();
+    assert_eq!(contents, vec!["data/list/a.txt".to_string()]);
+    assert_eq!(prefixes, vec!["data/list/sub/".to_string()]);
+}
+
+#[tokio::test]
+async fn list_objects_v2_missing_prefix_directory_is_empty() {
+    // S3 semantics: listing a non-existent prefix returns an empty page, not an
+    // error — clients probe `prefix=<table>/<partition>=x/` constantly (e.g. before
+    // a partition exists). The prefix push-down must map the HDFS `FileNotFound` of
+    // the start directory to an empty listing.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/a.txt", b"a").await;
+
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/nonexistent/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(resp.contents.unwrap_or_default().is_empty());
+    assert!(resp.common_prefixes.unwrap_or_default().is_empty());
+    assert_eq!(resp.is_truncated, Some(false));
+    assert_eq!(resp.key_count, Some(0));
+    assert!(resp.next_continuation_token.is_none());
+}
+
+#[tokio::test]
+async fn list_objects_v2_prefix_pointing_at_file_is_empty() {
+    // A prefix whose directory portion is actually a file matches nothing (S3
+    // semantics) — the push-down must not turn this into an error. The NameNode
+    // `getListing` RPC reports a file path the same way as a missing one.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/a.txt", b"a").await;
+
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/a.txt/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    assert!(resp.contents.unwrap_or_default().is_empty());
+    assert_eq!(resp.key_count, Some(0));
+}
+
+#[tokio::test]
+async fn list_objects_v2_prefix_bounds_hdfs_walk() {
+    // The S3 `prefix` must be pushed down to HDFS: a LIST of a subtree must not
+    // walk (and fail on) directories outside it. We seed an unreadable directory at
+    // the scope root, then list a different subtree as an unprivileged user. If the
+    // gateway walked the whole root, the recursive `list_status` would hit the
+    // unreadable directory and abort with AccessControlException (→ 403); with the
+    // bounded walk it never sees it and returns the requested subtree normally.
+    let scope = TestScope::new().await;
+    scope.write_file("data/a.txt", b"a").await;
+
+    // An unreadable directory at the root (mode 000, owned by the superuser).
+    let forbidden = format!("{}/forbidden", scope.root);
+    let super_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .build()
+        .unwrap();
+    super_client.mkdirs(&forbidden, 0o000, true).await.unwrap();
+    super_client
+        .set_owner(&forbidden, Some("root"), Some("supergroup"))
+        .await
+        .unwrap();
+
+    // Sanity: a full-root listing as `nobody` must be denied (the walk would hit
+    // the unreadable directory) — proving the fixture actually blocks traversal.
+    let gateway = scope.gateway_as("nobody");
+    let err = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "full-root listing as nobody must be denied by the unreadable dir: {err:?}"
+    );
+
+    // A prefix-bounded listing of the readable subtree must succeed and return it.
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(keys, vec!["data/a.txt".to_string()]);
+}
+
+#[tokio::test]
 async fn list_objects_v2_large_dir() {
     // A directory with many thousands of entries must list completely
     // and return every key exactly once. This also surfaces whether `hdfs-native`'s listing
@@ -541,6 +684,167 @@ async fn get_object_conditionals() {
         .await
         .unwrap_err();
     assert!(format!("{err:?}").contains("PreconditionFailed"));
+}
+
+#[tokio::test]
+async fn head_object_accept_ranges_and_conditionals() {
+    // HEAD must advertise byte-range support and honor the same RFC 7232
+    // conditional headers as GET (clients use HEAD for cheap freshness checks).
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/c.txt", b"conditional").await;
+
+    // Plain HEAD → 200 with Accept-Ranges: bytes.
+    let resp = gateway
+        .head_object(req(HeadObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/c.txt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.output.accept_ranges,
+        Some("bytes".to_string()),
+        "HEAD must advertise byte-range support"
+    );
+    let etag = resp.output.e_tag.clone().unwrap();
+
+    // If-None-Match: <etag> → 304 NotModified (RFC 7232 applies to HEAD too).
+    let err = gateway
+        .head_object(req(HeadObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/c.txt".into(),
+            if_none_match: Some(ETagCondition::ETag(etag.clone())),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("NotModified"));
+
+    // If-Match: wrong etag → 412 PreconditionFailed.
+    let err = gateway
+        .head_object(req(HeadObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/c.txt".into(),
+            if_match: Some(ETagCondition::ETag(ETag::Strong("deadbeef".to_string()))),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("PreconditionFailed"));
+
+    // If-Modified-Since: a timestamp in the future → 304 (not modified since).
+    let future = Timestamp::from(SystemTime::now() + Duration::from_secs(3600));
+    let err = gateway
+        .head_object(req(HeadObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/c.txt".into(),
+            if_modified_since: Some(future),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("NotModified"));
+}
+
+#[tokio::test]
+async fn get_object_empty_file_ranges() {
+    // Range semantics on a zero-length object (regression test for the
+    // Content-Range u64 underflow: `resolve_range(0, Suffix)` used to return a
+    // zero-length window and the header arithmetic wrapped around).
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/empty.bin", b"").await;
+
+    // Suffix range on an empty file: unsatisfiable → 416 InvalidRange (AWS S3
+    // behavior).
+    let err = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/empty.bin".into(),
+            range: Some(Range::Suffix { length: 10 }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("InvalidRange"));
+
+    // A zero-length suffix is also unsatisfiable.
+    let err = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/empty.bin".into(),
+            range: Some(Range::Suffix { length: 0 }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("InvalidRange"));
+
+    // A full (unranged) GET of an empty file still works: 200 with zero bytes.
+    let resp = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/empty.bin".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.output.content_length, Some(0));
+    assert!(collect_body(resp.output.body.unwrap()).await.is_empty());
+}
+
+#[tokio::test]
+async fn list_objects_v2_invalid_token_rejected() {
+    // A malformed continuation token must be a client error (`InvalidToken`),
+    // not a silent restart at page 1 — otherwise a client with a corrupted or
+    // truncated token polls the first page forever.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/a.txt", b"a").await;
+    _scope.write_file("data/b.txt", b"b").await;
+
+    let err = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            continuation_token: Some("not base64 !!!".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("InvalidToken"),
+        "invalid token must be rejected with InvalidToken, got: {err:?}"
+    );
+
+    // Sanity: a well-formed token from a real truncated listing still decodes
+    // (URL-safe base64, no padding) and resumes at the right key.
+    let first = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            max_keys: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let token = first
+        .next_continuation_token
+        .expect("page must be truncated");
+    let second = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            continuation_token: Some(token),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = second
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(keys, vec!["data/b.txt".to_string()]);
 }
 
 /// Collect a streaming body into a single `Vec<u8>`.

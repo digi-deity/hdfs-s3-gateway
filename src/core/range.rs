@@ -48,6 +48,13 @@ pub fn resolve_range(file_len: u64, range: ByteRange) -> Option<(u64, u64)> {
                 return None;
             }
             let length = length.min(file_len);
+            if length == 0 {
+                // Empty file: there are no bytes to return, so no suffix exists.
+                // AWS S3 answers this with 416 InvalidRange; an empty window would
+                // otherwise leak into `Content-Range` arithmetic (e.g. `end - 1`
+                // underflowing u64 in the caller).
+                return None;
+            }
             Some((file_len - length, file_len))
         }
     }
@@ -158,11 +165,11 @@ mod tests {
     }
 
     #[test]
-    fn suffix_on_empty_file_is_empty_window() {
-        // An empty file yields a zero-length window (0..0), not an error.
-        assert_eq!(
-            resolve_range(0, ByteRange::Suffix { length: 10 }),
-            Some((0, 0))
-        );
+    fn suffix_on_empty_file_unsatisfiable() {
+        // An empty file has no suffix: the range is unsatisfiable (AWS S3 returns
+        // 416 InvalidRange). A zero-length window (0..0) would underflow the
+        // caller's `Content-Range` computation (`end - 1` on u64).
+        assert_eq!(resolve_range(0, ByteRange::Suffix { length: 10 }), None);
+        assert_eq!(resolve_range(0, ByteRange::Suffix { length: 0 }), None);
     }
 }
