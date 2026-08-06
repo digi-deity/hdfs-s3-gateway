@@ -72,6 +72,31 @@ async fn conformance_http() {
         resp.headers().get("x-amz-request-id").is_some(),
         "request-id must be present"
     );
+    assert_eq!(
+        resp.headers().get("accept-ranges").unwrap(),
+        "bytes",
+        "HEAD must advertise byte-range support"
+    );
+
+    // --- HEAD conditional: If-None-Match with the object's current ETag → 304 -------
+    let etag = resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let resp = http
+        .head(format!("{base}/data/obj.txt"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        304,
+        "HEAD If-None-Match with current ETag must be 304"
+    );
 
     // --- GET full body matches exactly ---------------------------------------------------
     let resp = http
@@ -106,6 +131,21 @@ async fn conformance_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+
+    // --- error responses carry the correlation request id too -------------------------
+    // A wrong-bucket request fails before any success response is built; the error
+    // must still carry `x-amz-request-id` so clients/operators can correlate it
+    // with the server logs.
+    let resp = http
+        .get(format!("http://{addr}/wrongbucket/key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown bucket must 404");
+    assert!(
+        resp.headers().get("x-amz-request-id").is_some(),
+        "error responses must carry x-amz-request-id"
+    );
 
     // --- LIST (no delimiter) returns both files as Contents ------------------------------
     let resp = http

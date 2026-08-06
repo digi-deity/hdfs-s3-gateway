@@ -21,7 +21,7 @@ Rust HDFS client — no JVM at runtime).
 | Operation | Status |
 |---|---|
 | `HeadBucket`, `ListBuckets` | Supported |
-| `HeadObject` | Supported |
+| `HeadObject` | Supported (advertises `Accept-Ranges: bytes`, honors RFC 7232 conditionals `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since`) |
 | `GetObject` (full body, byte ranges, conditionals `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since`) | Supported (streamed, never buffered in full) |
 | `ListObjectsV2` (prefix, delimiter, max-keys, continuation token) | Supported |
 | `GetBucketVersioning` / `GetBucketTagging` / `GetBucketAcl` / `GetBucketCors` | Return the "not configured" shapes a fresh S3 bucket returns (no error) |

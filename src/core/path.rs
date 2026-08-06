@@ -83,6 +83,40 @@ impl PathMapper {
         }
     }
 
+    /// The HDFS directory at which a `ListObjectsV2` with S3 `prefix` should start,
+    /// so the recursive HDFS walk is bounded to the requested subtree instead of the
+    /// entire `hdfs_root`.
+    ///
+    /// Every key that matches `prefix` lives under the *directory part* of the prefix
+    /// (the portion up to and including the last `/`; the root itself when the prefix
+    /// has no `/`, since a key like `ab/c` matches the prefix `a`). Listing that
+    /// directory recursively and then filtering with the full `prefix` (as
+    /// `list_to_contents` does) yields exactly the same result as listing the whole
+    /// root — with a walk proportional to what the caller asked for.
+    ///
+    /// Returns `None` when no key under the root can ever match the prefix: the
+    /// directory part escapes the root via `..` (rejected by normalization), or the
+    /// prefix begins with a `.`/`..` segment that no normalized key can start with.
+    /// The caller should answer with an empty listing instead of walking anything.
+    pub fn list_start(&self, prefix: &str) -> Option<String> {
+        // No normalized key contains a `.` or `..` segment, so a prefix whose first
+        // segment is one of those can never match — avoid even a root walk.
+        let first = prefix.split('/').next().unwrap_or("");
+        if first == "." || first == ".." {
+            return None;
+        }
+
+        match prefix.rfind('/') {
+            // No `/` in the prefix: matching keys may live at any depth (e.g. the
+            // key `ab/c` matches the prefix `a`), so the root is the tightest bound.
+            None => Some(self.root.clone()),
+            // Everything up to and including the last `/` is the directory that must
+            // contain every matching key. `key_to_hdfs_path` normalizes it and
+            // rejects anything that would escape the configured root.
+            Some(i) => self.key_to_hdfs_path(&prefix[..=i]),
+        }
+    }
+
     /// Inverse of [`key_to_hdfs_path`]: given an absolute HDFS path, return the S3 key
     /// relative to the root. Returns `None` if the path is not under the root.
     pub fn hdfs_path_to_key(&self, hdfs_path: &str) -> Option<String> {
@@ -335,6 +369,65 @@ mod tests {
     fn root_slash_normalizes_root() {
         let m = root_mapper();
         assert_eq!(m.root(), "/");
+    }
+
+    // --- list_start: the S3 prefix is pushed down to bound the HDFS walk -----------
+
+    #[test]
+    fn list_start_root_when_no_slash() {
+        let m = mapper(); // root /data
+                          // No '/' in the prefix: matching keys can live at any depth (e.g. `ab/c`
+                          // matches the prefix `a`), so the whole root is the tightest bound.
+        assert_eq!(m.list_start(""), Some("/data".into()));
+        assert_eq!(m.list_start("a"), Some("/data".into()));
+        assert_eq!(m.list_start("ab"), Some("/data".into()));
+    }
+
+    #[test]
+    fn list_start_directory_portion() {
+        let m = mapper();
+        // The directory part is everything up to and including the last '/'.
+        assert_eq!(m.list_start("a/b/c.txt"), Some("/data/a/b".into()));
+        assert_eq!(m.list_start("a/b/"), Some("/data/a/b".into()));
+        assert_eq!(m.list_start("a/"), Some("/data/a".into()));
+        // A prefix ending in a partial filename still starts at its directory.
+        assert_eq!(m.list_start("a/b"), Some("/data/a".into()));
+        assert_eq!(m.list_start("a"), Some("/data".into()));
+    }
+
+    #[test]
+    fn list_start_rejects_escape_and_junk() {
+        let m = mapper();
+        // Directory part escapes the root → nothing can match → None.
+        assert_eq!(m.list_start("../etc/passwd"), None);
+        assert_eq!(m.list_start("a/../../etc"), None);
+        assert_eq!(m.list_start("../"), None);
+        // A slash-less prefix that is exactly '.' or '..' can never match a key.
+        assert_eq!(m.list_start(".."), None);
+        assert_eq!(m.list_start("."), None);
+        // Leading-slash prefixes normalize to an empty key → no match → None.
+        assert_eq!(m.list_start("/x"), None);
+        assert_eq!(m.list_start("/"), None);
+        // A '.'/'..' segment deeper in the prefix matches nothing, but the walk
+        // stays contained inside the root (never escapes it).
+        assert_eq!(m.list_start("a/../b"), Some("/data".into()));
+        assert_eq!(m.list_start("a/./b"), Some("/data/a".into()));
+    }
+
+    #[test]
+    fn root_slash_list_start() {
+        let m = root_mapper(); // root /
+        assert_eq!(m.list_start(""), Some("/".into()));
+        assert_eq!(m.list_start("a/b/c.txt"), Some("/a/b".into()));
+        assert_eq!(m.list_start("a/b/"), Some("/a/b".into()));
+        assert_eq!(m.list_start("appdata/foo"), Some("/appdata".into()));
+        assert_eq!(
+            m.list_start("appdata/foo/bar.parquet"),
+            Some("/appdata/foo".into())
+        );
+        assert_eq!(m.list_start(".."), None);
+        assert_eq!(m.list_start("../x"), None);
+        assert_eq!(m.list_start("/x"), None);
     }
 
     // --- normalize_abs platform independence (the actual root-cause fix) ---

@@ -80,6 +80,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// time so it is stable for an unchanged object. Shared by `HeadObject`/`GetObject` and
 /// `ListObjectsV2` so the same key always yields the same ETag regardless of which
 /// operation produced it.
+///
+/// KNOWN LIMITATION: the value is not content-derived, so two writes that produce the
+/// same length within the same millisecond collide (the HDFS mtime granularity is
+/// milliseconds, and `FileStatus` carries no inode/file-id, block list, or checksum for
+/// us to mix in — `hdfs-native` 0.14.2 exposes none of them). Consumers using the ETag
+/// for cache invalidation can therefore serve stale bytes in that narrow collision
+/// window. When `hdfs-native` gains checksum or file-id support, switch this to a
+/// content-derived value; until then this is the best stable identifier available.
 pub fn fallback_etag(length: u64, modification_time: u64) -> String {
     format!("hdfs-{:x}-{:x}", length, modification_time)
 }

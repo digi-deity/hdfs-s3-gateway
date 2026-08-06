@@ -17,7 +17,7 @@ use hdfs_native::Client;
 use hdfs_native::ClientBuilder;
 use s3s::dto::*;
 use s3s::header::X_AMZ_REQUEST_ID;
-use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
+use s3s::{s3_error, S3Error, S3Request, S3Response, S3Result, S3};
 use tokio_util::io::ReaderStream;
 use tracing::Instrument;
 
@@ -110,10 +110,19 @@ impl RequestLog {
         self.ok = true;
     }
 
+    /// Attach this request's id to an `S3Error` so the HTTP error response carries
+    /// the same `x-amz-request-id` (header + XML `<RequestId>`) as success responses
+    /// and the server logs — clients/operators correlate on it. Used on every error
+    /// path so no error response is missing the correlation id.
+    fn attach(&self, err: S3Error) -> S3Error {
+        attach_error_request_id(self.request_id(), err)
+    }
+
     /// Consume the log (emitting the completion line on drop) and return `result`
-    /// unchanged. Used by error-returning methods so the request is still logged.
+    /// unchanged. Used by error-returning methods so the request is still logged;
+    /// the request id is attached to any error result.
     fn finish<T>(self, result: S3Result<T>) -> S3Result<T> {
-        result
+        result.map_err(|e| self.attach(e))
     }
 }
 
@@ -149,6 +158,27 @@ fn with_request_id<T>(mut resp: S3Response<T>, log: &mut RequestLog) -> S3Respon
     resp
 }
 
+/// Attach a request id to an `S3Error`: both the XML `<RequestId>` element and the
+/// `x-amz-request-id` HTTP header, so error responses correlate with the server logs
+/// exactly like success responses.
+///
+/// Note: s3s's `serialize_error` applies `S3Error::headers` by *replacing* the response
+/// header map, so we must re-include the XML `Content-Type` header that it sets before
+/// the replacement — otherwise the error body would lose its content type.
+fn attach_error_request_id(request_id: &str, mut err: S3Error) -> S3Error {
+    err.set_request_id(request_id.to_string());
+    let mut headers = http::HeaderMap::new();
+    if let Ok(val) = http::HeaderValue::from_str(request_id) {
+        headers.insert(X_AMZ_REQUEST_ID, val);
+    }
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/xml"),
+    );
+    err.set_headers(headers);
+    err
+}
+
 mod auth;
 pub use auth::SharedSecretAuth;
 mod error;
@@ -157,21 +187,37 @@ pub mod backpressure;
 pub mod server;
 mod write_policy;
 
-/// Enforce an exact content length on a byte stream. If the upstream stream yields more
-/// bytes than `content_length`, the excess is truncated; if it yields fewer (e.g. a
-/// mid-stream DataNode failure), the stream ends early and the consumer observes a
-/// short read rather than a silently-truncated "successful" response.
-fn bytes_stream<S, E>(
-    stream: S,
+/// Error produced while streaming a GET response body.
+#[derive(Debug, thiserror::Error)]
+enum GetBodyError {
+    /// The upstream HDFS reader failed mid-stream.
+    #[error("HDFS read failed: {0}")]
+    Upstream(#[from] std::io::Error),
+    /// The upstream stream ended before the declared content length was reached
+    /// (e.g. the file shrank between stat and read, or a DataNode failure that
+    /// surfaced as EOF). An explicit error beats a silently-short "successful"
+    /// response.
+    #[error("HDFS stream ended after {got} of {expected} declared bytes")]
+    ShortRead { expected: usize, got: usize },
+}
+
+/// Enforce an exact content length on a byte stream.
+///
+/// The HDFS reader streams from `set_position` to EOF in large chunks (the 64 KiB
+/// `ReaderStream` buffer), so a ranged GET's final chunk routinely extends past the
+/// requested window — the excess is truncated here. That is the normal contract, NOT
+/// a bug: the window's end is rarely chunk-aligned. What this wrapper detects is the
+/// opposite failure: the stream ending BEFORE `content_length` bytes were delivered
+/// (a mid-stream DataNode failure surfacing as EOF, or the file shrinking between
+/// `get_file_info` and `read`), which fails the stream explicitly rather than
+/// producing a silently-truncated "successful" response.
+fn bytes_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
     content_length: usize,
-) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
-where
-    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
-    E: Send + 'static,
-{
+) -> impl Stream<Item = Result<Bytes, GetBodyError>> + Send + 'static {
     futures::stream::unfold(
-        (stream, content_length),
-        |(mut stream, mut remaining)| async move {
+        (stream, content_length, content_length),
+        |(mut stream, limit, mut remaining)| async move {
             if remaining == 0 {
                 return None;
             }
@@ -181,10 +227,23 @@ where
                         bytes.truncate(remaining);
                     }
                     remaining -= bytes.len();
-                    Some((Ok(bytes), (stream, remaining)))
+                    Some((Ok(bytes), (stream, limit, remaining)))
                 }
-                Some(Err(e)) => Some((Err(e), (stream, remaining))),
-                None => None,
+                Some(Err(e)) => Some((Err(GetBodyError::Upstream(e)), (stream, limit, remaining))),
+                None => {
+                    if remaining > 0 {
+                        let got = limit - remaining;
+                        Some((
+                            Err(GetBodyError::ShortRead {
+                                expected: limit,
+                                got,
+                            }),
+                            (stream, limit, 0),
+                        ))
+                    } else {
+                        None
+                    }
+                }
             }
         },
     )
@@ -247,7 +306,7 @@ impl S3 for HdfsGateway {
         let mut log = RequestLog::new("HeadBucket");
         let bucket = req.input.bucket.as_str();
         if bucket != self.mapper.bucket() {
-            return Err(s3_error!(NoSuchBucket));
+            return Err(log.attach(s3_error!(NoSuchBucket)));
         }
         Ok(with_request_id(
             S3Response::new(HeadBucketOutput::default()),
@@ -263,14 +322,14 @@ impl S3 for HdfsGateway {
         let mut log = RequestLog::new("HeadObject");
         let input = req.input;
         if input.bucket.as_str() != self.mapper.bucket() {
-            return Err(s3_error!(NoSuchBucket));
+            return Err(log.attach(s3_error!(NoSuchBucket)));
         }
 
         let key = input.key.as_str();
         let hdfs_path = self
             .mapper
             .key_to_hdfs_path(key)
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
+            .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
         log.set_path(&hdfs_path);
 
         let status = self
@@ -278,11 +337,11 @@ impl S3 for HdfsGateway {
             .get_file_info(&hdfs_path)
             .instrument(log.span.clone())
             .await
-            .map_err(|e| map_hdfs_error(e, self.config.expose_upstream_errors))?;
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
 
         // Directories are never surfaced as objects.
         if status.isdir {
-            return Err(s3_error!(NoSuchKey));
+            return Err(log.attach(s3_error!(NoSuchKey)));
         }
 
         let meta = ObjectMetadata::from_hdfs(
@@ -292,14 +351,51 @@ impl S3 for HdfsGateway {
             status.modification_time,
             None, // hdfs-native does not expose getFileChecksum (not supported upstream)
         );
-
+        let etag = ETag::Strong(meta.etag());
         let last_modified = millis_to_timestamp(status.modification_time);
 
+        // --- Conditional headers (RFC 7232) — identical semantics to GetObject. ---
+        // HEAD is subject to the same preconditions; clients use it for cheap
+        // freshness checks (e.g. cache revalidation) and expect 304/412 here too.
+        // If-Match / If-Unmodified-Since → 412 PreconditionFailed when not satisfied.
+        // If-None-Match / If-Modified-Since → 304 NotModified when satisfied.
+        if let Some(cond) = &input.if_match {
+            let matched = match cond {
+                ETagCondition::Any => true,
+                ETagCondition::ETag(other) => etag.strong_cmp(other),
+            };
+            if !matched {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
+        }
+        if let Some(since) = &input.if_unmodified_since {
+            if last_modified > *since {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
+        }
+        if let Some(cond) = &input.if_none_match {
+            let not_modified = match cond {
+                ETagCondition::Any => true, // resource exists → not modified
+                ETagCondition::ETag(other) => etag.weak_cmp(other),
+            };
+            if not_modified {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
+        }
+        if let Some(since) = &input.if_modified_since {
+            if last_modified <= *since {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
+        }
+
         let output = HeadObjectOutput {
+            // RFC 9110: advertise that byte ranges are supported, so clients that
+            // probe (e.g. pyarrow/DuckDB) decide to issue ranged GETs.
+            accept_ranges: Some("bytes".to_string()),
             content_length: Some(status.length as i64),
             content_type: Some(meta.content_type()),
             last_modified: Some(last_modified),
-            e_tag: Some(ETag::Strong(meta.etag())),
+            e_tag: Some(etag),
             ..Default::default()
         };
         Ok(with_request_id(S3Response::new(output), &mut log))
@@ -332,7 +428,7 @@ impl S3 for HdfsGateway {
         let mut log = RequestLog::new("ListObjectsV2");
         let input = req.input;
         if input.bucket.as_str() != self.mapper.bucket() {
-            return Err(s3_error!(NoSuchBucket));
+            return Err(log.attach(s3_error!(NoSuchBucket)));
         }
 
         let prefix = input.prefix.as_deref().unwrap_or("").to_string();
@@ -342,16 +438,46 @@ impl S3 for HdfsGateway {
         let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
         let max_keys = input.max_keys.unwrap_or(1000) as usize;
 
-        // List everything under the bucket root (recursive), then translate.
-        let root = self.mapper.root().to_string();
-        let statuses = self
-            .client
-            .list_status(&root, true)
-            .instrument(log.span.clone())
-            .await
-            .map_err(|e| map_hdfs_error(e, self.config.expose_upstream_errors))?;
+        // Push the directory portion of `prefix` down to HDFS so the recursive walk
+        // is bounded to the requested subtree instead of the entire `hdfs_root`
+        // (previously: one `getListing` RPC per directory of the whole root, including
+        // directories the caller never asked about — which also generated a flood of
+        // AccessControlExceptions on wide roots with unreadable directories).
+        // `list_to_contents` below still filters with the full `prefix`, so the result
+        // is identical — only the walk is bounded.
+        let statuses = match self.mapper.list_start(&prefix) {
+            // The prefix cannot match any key under the root (e.g. it escapes it):
+            // S3 semantics — an empty listing, not an error.
+            None => Vec::new(),
+            Some(hdfs_start) => match self
+                .client
+                .list_status(&hdfs_start, true)
+                .instrument(log.span.clone())
+                .await
+            {
+                Ok(statuses) => statuses,
+                // The prefix's directory does not exist (or the prefix points at a
+                // file, which the NameNode `getListing` reports the same way):
+                // nothing can match — an empty listing, not an error. Clients probe
+                // non-existent prefixes (e.g. `table/partition=x/` before it exists)
+                // constantly, and real S3 answers those with an empty page.
+                Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
+                Err(e) => {
+                    return Err(log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))
+                }
+            },
+        };
 
         let mut entries: Vec<ListEntry> = Vec::new();
+        // NOTE: the whole bounded subtree is materialized in memory before
+        // pagination (`max_keys` is applied after sorting, never during the walk).
+        // The prefix push-down above bounds this to the requested subtree, but a
+        // huge prefix can still load a lot. A hard cap during the walk would be
+        // incorrect (hdfs-native's depth-first walk is unsorted, so stopping early
+        // could miss keys that sort before what was collected, and the client
+        // would paginate forever); a correct fix needs a sorted lazy merge, which
+        // upstream does not offer. Operators on very wide roots should expose a
+        // narrow `hdfs_root` per gateway.
         for s in statuses {
             if s.isdir {
                 continue; // directories are not objects
@@ -375,12 +501,16 @@ impl S3 for HdfsGateway {
         let (mut contents, common) = list_to_contents(&entries, &prefix, delimiter);
         let common_vec = common.into_vec();
 
-        // Pagination: resume after the decoded continuation token.
-        let start_after = input
-            .continuation_token
-            .as_deref()
-            .and_then(decode_token)
-            .or_else(|| input.start_after.clone());
+        // Pagination: resume after the decoded continuation token. A token that does
+        // not decode is a client error (`InvalidToken`, matching AWS S3) — silently
+        // falling back to the first page would make a client with a corrupted or
+        // truncated token poll page 1 forever.
+        let start_after = match input.continuation_token.as_deref() {
+            Some(token) => {
+                Some(decode_token(token).ok_or_else(|| log.attach(s3_error!(InvalidToken)))?)
+            }
+            None => input.start_after.clone(),
+        };
 
         if let Some(marker) = &start_after {
             contents.retain(|e| &e.key > marker);
@@ -459,14 +589,14 @@ impl S3 for HdfsGateway {
         let mut log = RequestLog::new("GetObject");
         let input = req.input;
         if input.bucket.as_str() != self.mapper.bucket() {
-            return Err(s3_error!(NoSuchBucket));
+            return Err(log.attach(s3_error!(NoSuchBucket)));
         }
 
         let key = input.key.as_str();
         let hdfs_path = self
             .mapper
             .key_to_hdfs_path(key)
-            .ok_or_else(|| s3_error!(NoSuchKey))?;
+            .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
         log.set_path(&hdfs_path);
 
         let status = self
@@ -474,11 +604,11 @@ impl S3 for HdfsGateway {
             .get_file_info(&hdfs_path)
             .instrument(log.span.clone())
             .await
-            .map_err(|e| map_hdfs_error(e, self.config.expose_upstream_errors))?;
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
 
         // Directories are never surfaced as objects.
         if status.isdir {
-            return Err(s3_error!(NoSuchKey));
+            return Err(log.attach(s3_error!(NoSuchKey)));
         }
 
         let file_len = status.length as u64;
@@ -503,12 +633,12 @@ impl S3 for HdfsGateway {
                 ETagCondition::ETag(other) => etag.strong_cmp(other),
             };
             if !matched {
-                return Err(s3_error!(PreconditionFailed));
+                return Err(log.attach(s3_error!(PreconditionFailed)));
             }
         }
         if let Some(since) = &input.if_unmodified_since {
             if last_modified > *since {
-                return Err(s3_error!(PreconditionFailed));
+                return Err(log.attach(s3_error!(PreconditionFailed)));
             }
         }
         if let Some(cond) = &input.if_none_match {
@@ -517,12 +647,12 @@ impl S3 for HdfsGateway {
                 ETagCondition::ETag(other) => etag.weak_cmp(other),
             };
             if not_modified {
-                return Err(s3_error!(NotModified));
+                return Err(log.attach(s3_error!(NotModified)));
             }
         }
         if let Some(since) = &input.if_modified_since {
             if last_modified <= *since {
-                return Err(s3_error!(NotModified));
+                return Err(log.attach(s3_error!(NotModified)));
             }
         }
 
@@ -538,29 +668,45 @@ impl S3 for HdfsGateway {
                     Range::Suffix { length } => crate::core::ByteRange::Suffix { length },
                 };
                 let (s, e) = crate::core::resolve_range(file_len, resolved)
-                    .ok_or_else(|| s3_error!(InvalidRange))?;
+                    .ok_or_else(|| log.attach(s3_error!(InvalidRange)))?;
                 let len = e - s;
                 let cr = fmt_content_range(s, e - 1, file_len);
                 (s, e, len, Some(cr))
             }
         };
 
-        // --- Streaming body (never buffer the whole object) ----------------
+        // hdfs-native addresses readers with `usize`, so on 32-bit targets a window
+        // beyond 4 GiB cannot be addressed — silently truncating the offset would
+        // serve the wrong bytes. Reject it explicitly (416) instead; on 64-bit
+        // targets this never triggers.
+        let Ok(window_start) = usize::try_from(start) else {
+            return Err(log.attach(s3_error!(InvalidRange)));
+        };
+        let Ok(window_end) = usize::try_from(end_exclusive) else {
+            return Err(log.attach(s3_error!(InvalidRange)));
+        };
+
+        // --- Streaming body (never buffer the whole object) -------------
         let mut reader = self
             .client
             .read(&hdfs_path)
             .instrument(log.span.clone())
             .await
-            .map_err(|e| map_hdfs_error(e, self.config.expose_upstream_errors))?;
-        reader.set_position(start as usize);
-        let remaining = (end_exclusive - start) as usize;
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+        reader.set_position(window_start);
+        let remaining = window_end - window_start;
 
         let stream = ReaderStream::with_capacity(reader, 64 * 1024);
-        // `bytes_stream` enforces the exact content length so a truncated read surfaces as
-        // an error rather than a silently-short "successful" response.
+        // `bytes_stream` enforces the exact content length: the final chunk of a
+        // ranged read is truncated to the window (the HDFS reader streams in 64 KiB
+        // chunks past the range end — normal), and an upstream stream that ends
+        // early fails with a short-read error instead of a silently-short
+        // "successful" response.
         let body = bytes_stream(stream, remaining);
 
         let output = GetObjectOutput {
+            // RFC 9110: advertise byte-range support on GET responses too.
+            accept_ranges: Some("bytes".to_string()),
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some(content_length as i64),
             content_range,
