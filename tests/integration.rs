@@ -372,6 +372,103 @@ async fn list_objects_v2_prefix_with_delimiter() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_delimiter_pagination_terminates() {
+    // Regression for the infinite-pagination loop: a delimiter listing with more
+    // CommonPrefixes than max-keys used to re-serve the same page forever (the
+    // continuation marker was applied to Contents only, never to CommonPrefixes), so
+    // a client paginator looped and every iteration re-walked the subtree. Walking
+    // every page must yield each partition exactly once and terminate.
+    let (_scope, gateway, _client) = setup().await;
+    for i in 1..=7 {
+        _scope
+            .write_file(&format!("data/tbl/part{i}/f.txt"), b"x")
+            .await;
+    }
+
+    let mut all: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= 8,
+            "delimiter pagination must terminate (infinite loop?)"
+        );
+        let resp = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/tbl/".into()),
+                delimiter: Some("/".into()),
+                max_keys: Some(2),
+                continuation_token: token.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert!(
+            resp.contents.unwrap_or_default().is_empty(),
+            "a pure-partition listing has no Contents"
+        );
+        let page: Vec<String> = resp
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.prefix.unwrap())
+            .collect();
+        for p in &page {
+            assert!(!all.contains(p), "duplicate common prefix {p}");
+        }
+        all.extend(page);
+        match resp.next_continuation_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    let expected: Vec<String> = (1..=7).map(|i| format!("data/tbl/part{i}/")).collect();
+    assert_eq!(all, expected);
+}
+
+#[tokio::test]
+async fn list_objects_v2_delimiter_shows_empty_directory() {
+    // A delimiter listing lists exactly one HDFS directory (one getListing RPC).
+    // Emptiness is not probed (that would cost an RPC per directory), so an EMPTY
+    // directory surfaces as a CommonPrefix — the namespace is surfaced as-is.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/tbl/filled/f.txt", b"x").await;
+    _scope
+        .client
+        .mkdirs(&format!("{}/data/tbl/empty", _scope.root), 0o755, true)
+        .await
+        .unwrap();
+
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/tbl/".into()),
+            delimiter: Some("/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let prefixes: Vec<String> = resp
+        .common_prefixes
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.prefix.unwrap())
+        .collect();
+    assert_eq!(
+        prefixes,
+        vec![
+            "data/tbl/empty/".to_string(),
+            "data/tbl/filled/".to_string(),
+        ]
+    );
+    assert!(resp.contents.unwrap_or_default().is_empty());
+}
+
+#[tokio::test]
 async fn list_objects_v2_missing_prefix_directory_is_empty() {
     // S3 semantics: listing a non-existent prefix returns an empty page, not an
     // error — clients probe `prefix=<table>/<partition>=x/` constantly (e.g. before

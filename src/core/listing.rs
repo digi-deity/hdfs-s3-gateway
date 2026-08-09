@@ -64,6 +64,113 @@ pub fn list_to_contents(
     (contents, common)
 }
 
+/// The result of paginating a listing: the page's Contents and CommonPrefixes (both in
+/// strict key order), whether more keys remain, and the raw last key of the page to resume
+/// from (the S3 layer base64-encodes it into the continuation token).
+pub struct Page {
+    /// Contents that fall on this page (already key-sorted).
+    pub contents: Vec<ListEntry>,
+    /// CommonPrefixes that fall on this page (already key-sorted).
+    pub common_prefixes: Vec<String>,
+    /// Whether more keys exist beyond this page.
+    pub is_truncated: bool,
+    /// The last key of this page (a Content or a CommonPrefix), used to resume. `Some`
+    /// exactly when `is_truncated`.
+    pub next_token: Option<String>,
+}
+
+/// Compute one page of a delimiter'd listing from the DIRECT CHILDREN of the prefix's
+/// directory: `files` (file keys under it) and `dirs` (directory keys under it).
+///
+/// This is the pure counterpart of the S3 layer's single non-recursive `getListing`:
+/// with a delimiter, a listing's output is fully determined by one directory level, so
+/// nothing deeper is ever needed (a recursive walk would cost one RPC per directory of
+/// the subtree for zero extra information).
+///
+/// Semantics:
+/// - Contents are the file keys whose remainder after `prefix` contains no delimiter;
+///   everything else collapses to a CommonPrefix (files included — e.g. prefix `t` and
+///   key `t/ca` collapse to `t/`, because the remainder starts with `/`).
+/// - Directories always collapse to the CommonPrefix that would contain their keys;
+///   an EMPTY directory is still a real CommonPrefix here, because the caller lists one
+///   directory non-recursively and cannot know emptiness without an extra RPC per
+///   directory — the very amplification this one-level path exists to avoid.
+/// - Directories whose key does not start with `prefix` can never contain a matching
+///   key and are ignored.
+/// - Pagination interleaves Contents and CommonPrefixes in strict key order; the
+///   `marker` (decoded continuation token or `start_after`) filters BOTH (strictly
+///   greater). Filtering only Contents would re-serve CommonPrefixes ≤ the marker when
+///   a page is cut inside a run of them, looping the client on the same page forever —
+///   each iteration re-triggering the HDFS listing.
+pub fn paginate(
+    files: &[ListEntry],
+    dirs: &[String],
+    prefix: &str,
+    delimiter: Option<&str>,
+    marker: Option<&str>,
+    max_keys: usize,
+) -> Page {
+    let (mut contents, common) = list_to_contents(files, prefix, delimiter);
+    let mut common_vec = common.into_vec();
+
+    // Directories collapse to the CommonPrefix that would contain all of their keys,
+    // mirroring `list_to_contents`' rule for file keys: everything up to and including
+    // the first delimiter after `prefix`; when the prefix is the directory's own name
+    // (no trailing slash, e.g. prefix `t` and directory `ta`), that is `ta/`.
+    for dir in dirs {
+        if !dir.starts_with(prefix) {
+            continue; // nothing under a non-matching directory can match the prefix
+        }
+        let rest = &dir[prefix.len()..];
+        let common_prefix = match rest.find('/') {
+            Some(i) => format!("{prefix}{}", &rest[..i + 1]),
+            None => format!("{dir}/"),
+        };
+        common_vec.push(common_prefix);
+    }
+    common_vec.sort();
+    common_vec.dedup();
+
+    // Strict key order (S3 guarantee).
+    contents.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+
+    if let Some(marker) = marker {
+        contents.retain(|e| e.key.as_str() > marker);
+        common_vec.retain(|p| p.as_str() > marker);
+    }
+
+    // Interleave Contents and CommonPrefixes in key order for pagination.
+    let mut all_keys: Vec<String> = contents.iter().map(|e| e.key.clone()).collect();
+    all_keys.extend(common_vec.iter().cloned());
+    all_keys.sort();
+
+    let take = max_keys.min(all_keys.len());
+    let page: Vec<String> = all_keys[..take].to_vec();
+    let is_truncated = take < all_keys.len();
+
+    let page_set: std::collections::HashSet<&String> = page.iter().collect();
+    let contents = contents
+        .into_iter()
+        .filter(|e| page_set.contains(&e.key))
+        .collect();
+    let common_prefixes = common_vec
+        .into_iter()
+        .filter(|p| page_set.contains(p))
+        .collect();
+    let next_token = if is_truncated {
+        page.last().cloned()
+    } else {
+        None
+    };
+
+    Page {
+        contents,
+        common_prefixes,
+        is_truncated,
+        next_token,
+    }
+}
+
 /// Encode a continuation token: URL-safe base64 (no padding) of the last returned key.
 ///
 /// NOTE: this is **not an authenticated token**. It is trivially decodable (it
@@ -192,5 +299,147 @@ mod tests {
         assert_eq!(decode_token("%%%not-base64%%%"), None);
         assert_eq!(decode_token("a"), None); // 1-char final quantum: invalid base64
         assert_eq!(decode_token(""), Some(String::new())); // empty key encodes to empty
+    }
+
+    // --- paginate: one-level delimiter pages ------------------------------------------
+
+    /// Walk every page of a delimiter'd listing the way a client paginator does,
+    /// asserting that pagination terminates and yields no duplicate prefixes.
+    fn walk_pages(
+        files: &[ListEntry],
+        dirs: &[String],
+        prefix: &str,
+        max_keys: usize,
+    ) -> Vec<String> {
+        let mut all: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 16, "pagination must terminate (infinite loop?)");
+            let page = paginate(files, dirs, prefix, Some("/"), marker.as_deref(), max_keys);
+            for c in &page.common_prefixes {
+                assert!(
+                    !all.contains(c),
+                    "duplicate common prefix on page {pages}: {c}"
+                );
+            }
+            all.extend(page.common_prefixes.iter().cloned());
+            match page.next_token {
+                Some(t) => marker = Some(t),
+                None => break,
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn paginate_more_prefixes_than_max_keys_terminates() {
+        // THE regression: with a delimiter and more CommonPrefixes than max_keys, the
+        // continuation marker used to be applied to Contents only, so every page
+        // re-served the same prefixes and a client paginator looped forever (each
+        // iteration re-triggering the HDFS listing). Filtering CommonPrefixes by the
+        // marker too makes the walk advance page by page.
+        let dirs: Vec<String> = (1..=5).map(|i| format!("a/part{i}")).collect();
+        let all = walk_pages(&[], &dirs, "a/", 2);
+        assert_eq!(
+            all,
+            vec![
+                "a/part1/".to_string(),
+                "a/part2/".to_string(),
+                "a/part3/".to_string(),
+                "a/part4/".to_string(),
+                "a/part5/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn paginate_mixed_contents_and_prefixes_page_advances() {
+        let files = vec![entry("a/x.txt"), entry("a/z.txt")];
+        let dirs = vec!["a/m".to_string(), "a/y".to_string()];
+        // Sorted interleave of everything under `a/`: a/m/, a/x.txt, a/y/, a/z.txt.
+        let page1 = paginate(&files, &dirs, "a/", Some("/"), None, 2);
+        assert_eq!(page1.contents, vec![entry("a/x.txt")]);
+        assert_eq!(page1.common_prefixes, vec!["a/m/".to_string()]);
+        assert!(page1.is_truncated);
+        let marker = page1.next_token.clone().unwrap();
+        assert_eq!(marker, "a/x.txt");
+        // Resuming must skip BOTH the old contents and the old prefixes.
+        let page2 = paginate(&files, &dirs, "a/", Some("/"), Some(&marker), 2);
+        assert_eq!(page2.contents, vec![entry("a/z.txt")]);
+        assert_eq!(page2.common_prefixes, vec!["a/y/".to_string()]);
+        assert!(!page2.is_truncated);
+        assert!(page2.next_token.is_none());
+    }
+
+    #[test]
+    fn paginate_empty_dir_is_a_common_prefix() {
+        // An empty HDFS directory is surfaced as a CommonPrefix: the one-level listing
+        // cannot know it is empty without an extra RPC per directory.
+        let files: Vec<ListEntry> = Vec::new();
+        let dirs = vec!["a/empty".to_string()];
+        let page = paginate(&files, &dirs, "a/", Some("/"), None, 100);
+        assert!(page.contents.is_empty());
+        assert_eq!(page.common_prefixes, vec!["a/empty/".to_string()]);
+        assert!(!page.is_truncated);
+    }
+
+    #[test]
+    fn paginate_ignores_dirs_outside_prefix() {
+        let files: Vec<ListEntry> = vec![entry("a/x.txt")];
+        let dirs = vec!["a/keep".to_string(), "b/other".to_string()];
+        let page = paginate(&files, &dirs, "a/", Some("/"), None, 100);
+        assert_eq!(page.contents, vec![entry("a/x.txt")]);
+        assert_eq!(page.common_prefixes, vec!["a/keep/".to_string()]);
+    }
+
+    #[test]
+    fn paginate_slashless_prefix_collapses() {
+        // Prefix without '/': matching keys may live at any depth, so the collapse rule
+        // applies to the remainder after the prefix. A file `t/ca` collapses into `t/`
+        // (its remainder starts with '/'), a directory `ta` collapses into `ta/`, and
+        // `t.txt` (remainder `.txt`) is a Content.
+        let files = vec![entry("t/ca"), entry("t.txt")];
+        let dirs = vec!["ta".to_string()];
+        let page = paginate(&files, &dirs, "t", Some("/"), None, 100);
+        assert_eq!(page.contents, vec![entry("t.txt")]);
+        assert_eq!(
+            page.common_prefixes,
+            vec!["t/".to_string(), "ta/".to_string()]
+        );
+    }
+
+    #[test]
+    fn paginate_marker_is_strictly_greater() {
+        // '.' (0x2E) sorts before '/' (0x2F): a file `a/sub.txt` sorts BEFORE the
+        // CommonPrefix `a/sub/`. A marker of `a/sub/` must therefore drop `a/sub.txt`.
+        let files = vec![entry("a/sub.txt"), entry("a/sub/x.txt")];
+        let dirs = vec!["a/sub".to_string()];
+        let page = paginate(&files, &dirs, "a/", Some("/"), Some("a/sub/"), 100);
+        assert!(
+            page.contents.is_empty(),
+            "contents must be empty: {:?}",
+            page.contents
+        );
+        assert!(
+            page.common_prefixes.is_empty(),
+            "prefixes must be empty: {:?}",
+            page.common_prefixes
+        );
+    }
+
+    #[test]
+    fn paginate_max_keys_zero() {
+        // max-keys=0 keeps the existing semantics: an empty page that is still
+        // "truncated" when any key exists (a client that asked for nothing must be
+        // able to tell there is something to paginate).
+        let files = vec![entry("a/x.txt")];
+        let dirs = vec!["a/d".to_string()];
+        let page = paginate(&files, &dirs, "a/", Some("/"), None, 0);
+        assert!(page.contents.is_empty());
+        assert!(page.common_prefixes.is_empty());
+        assert!(page.is_truncated);
+        assert!(page.next_token.is_none());
     }
 }

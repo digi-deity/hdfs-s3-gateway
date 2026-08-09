@@ -8,7 +8,9 @@ pub mod metadata;
 pub mod path;
 pub mod range;
 
-pub use listing::{decode_token, encode_token, list_to_contents, CommonPrefixSet, ListEntry};
+pub use listing::{
+    decode_token, encode_token, list_to_contents, paginate, CommonPrefixSet, ListEntry,
+};
 pub use metadata::{fallback_etag, ObjectMetadata};
 pub use path::PathMapper;
 pub use range::{resolve_range, ByteRange};

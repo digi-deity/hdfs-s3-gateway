@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::core::{
-    decode_token, encode_token, list_to_contents, ListEntry, ObjectMetadata, PathMapper,
+    decode_token, encode_token, list_to_contents, paginate, ListEntry, ObjectMetadata, PathMapper,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -438,69 +438,6 @@ impl S3 for HdfsGateway {
         let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
         let max_keys = input.max_keys.unwrap_or(1000) as usize;
 
-        // Push the directory portion of `prefix` down to HDFS so the recursive walk
-        // is bounded to the requested subtree instead of the entire `hdfs_root`
-        // (previously: one `getListing` RPC per directory of the whole root, including
-        // directories the caller never asked about — which also generated a flood of
-        // AccessControlExceptions on wide roots with unreadable directories).
-        // `list_to_contents` below still filters with the full `prefix`, so the result
-        // is identical — only the walk is bounded.
-        let statuses = match self.mapper.list_start(&prefix) {
-            // The prefix cannot match any key under the root (e.g. it escapes it):
-            // S3 semantics — an empty listing, not an error.
-            None => Vec::new(),
-            Some(hdfs_start) => match self
-                .client
-                .list_status(&hdfs_start, true)
-                .instrument(log.span.clone())
-                .await
-            {
-                Ok(statuses) => statuses,
-                // The prefix's directory does not exist (or the prefix points at a
-                // file, which the NameNode `getListing` reports the same way):
-                // nothing can match — an empty listing, not an error. Clients probe
-                // non-existent prefixes (e.g. `table/partition=x/` before it exists)
-                // constantly, and real S3 answers those with an empty page.
-                Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
-                Err(e) => {
-                    return Err(log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))
-                }
-            },
-        };
-
-        let mut entries: Vec<ListEntry> = Vec::new();
-        // NOTE: the whole bounded subtree is materialized in memory before
-        // pagination (`max_keys` is applied after sorting, never during the walk).
-        // The prefix push-down above bounds this to the requested subtree, but a
-        // huge prefix can still load a lot. A hard cap during the walk would be
-        // incorrect (hdfs-native's depth-first walk is unsorted, so stopping early
-        // could miss keys that sort before what was collected, and the client
-        // would paginate forever); a correct fix needs a sorted lazy merge, which
-        // upstream does not offer. Operators on very wide roots should expose a
-        // narrow `hdfs_root` per gateway.
-        for s in statuses {
-            if s.isdir {
-                continue; // directories are not objects
-            }
-            let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
-                continue;
-            };
-            if key.is_empty() {
-                continue;
-            }
-            entries.push(ListEntry {
-                key,
-                size: s.length as u64,
-                modification_time: s.modification_time,
-            });
-        }
-
-        // Strict lexicographic order (S3 guarantee).
-        entries.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
-
-        let (mut contents, common) = list_to_contents(&entries, &prefix, delimiter);
-        let common_vec = common.into_vec();
-
         // Pagination: resume after the decoded continuation token. A token that does
         // not decode is a client error (`InvalidToken`, matching AWS S3) — silently
         // falling back to the first page would make a client with a corrupted or
@@ -512,25 +449,180 @@ impl S3 for HdfsGateway {
             None => input.start_after.clone(),
         };
 
-        if let Some(marker) = &start_after {
-            contents.retain(|e| &e.key > marker);
-        }
+        // Contents and CommonPrefixes of the requested page, in key order, plus the raw
+        // last key of the page (the next continuation token) when it is truncated.
+        let (page_entries, page_prefixes, is_truncated, next_token) = if delimiter.is_some() {
+            // --- Delimiter path: ONE non-recursive listing of the prefix directory. ---
+            // With a delimiter, a listing's output is fully determined by the direct
+            // children of the directory part of the prefix: matching files become
+            // Contents, matching subdirectories collapse into CommonPrefixes. A
+            // recursive walk (one `getListing` RPC per directory of the subtree) would
+            // be pure waste, so list exactly the one directory (`recursive = false`).
+            //
+            // Semantic note: an EMPTY HDFS directory is a real directory, so it now
+            // appears as a CommonPrefix. A recursive walk used to hide empty
+            // directories (only files became entries), but detecting emptiness would
+            // cost one extra RPC per directory — the very amplification this
+            // single-listing path exists to avoid. The namespace is surfaced as-is.
+            let statuses = match self.mapper.list_start(&prefix) {
+                // The prefix cannot match any key under the root (e.g. it escapes it):
+                // S3 semantics — an empty listing, not an error.
+                None => Vec::new(),
+                Some(hdfs_start) => match self
+                    .client
+                    .list_status(&hdfs_start, false)
+                    .instrument(log.span.clone())
+                    .await
+                {
+                    Ok(statuses) => statuses,
+                    // The prefix's directory does not exist (or the prefix points at a
+                    // file, which the NameNode `getListing` reports the same way):
+                    // nothing can match — an empty listing, not an error. Clients probe
+                    // non-existent prefixes (e.g. `table/partition=x/` before it exists)
+                    // constantly, and real S3 answers those with an empty page.
+                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
+                    Err(e) => {
+                        return Err(
+                            log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                        )
+                    }
+                },
+            };
 
-        // Interleave contents and common prefixes in key order for pagination.
-        let mut all_keys: Vec<String> = contents.iter().map(|e| e.key.clone()).collect();
-        all_keys.extend(common_vec.iter().cloned());
-        all_keys.sort();
+            let mut files: Vec<ListEntry> = Vec::new();
+            let mut dirs: Vec<String> = Vec::new();
+            for s in statuses {
+                let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                if s.isdir {
+                    dirs.push(key);
+                } else {
+                    files.push(ListEntry {
+                        key,
+                        size: s.length as u64,
+                        modification_time: s.modification_time,
+                    });
+                }
+            }
 
-        let total: Vec<String> = all_keys;
-        let take = max_keys.min(total.len());
-        let page: Vec<String> = total[..take].to_vec();
-        let is_truncated = take < total.len();
+            let page = paginate(
+                &files,
+                &dirs,
+                &prefix,
+                delimiter,
+                start_after.as_deref(),
+                max_keys,
+            );
+            (
+                page.contents,
+                page.common_prefixes,
+                page.is_truncated,
+                page.next_token,
+            )
+        } else {
+            // --- No-delimiter path: flat listing of every key under the prefix. ---
+            // Push the directory portion of `prefix` down to HDFS so the recursive walk
+            // is bounded to the requested subtree instead of the entire `hdfs_root`
+            // (previously: one `getListing` RPC per directory of the whole root, including
+            // directories the caller never asked about — which also generated a flood of
+            // AccessControlExceptions on wide roots with unreadable directories).
+            // `list_to_contents` below still filters with the full `prefix`, so the result
+            // is identical — only the walk is bounded.
+            let statuses = match self.mapper.list_start(&prefix) {
+                // The prefix cannot match any key under the root (e.g. it escapes it):
+                // S3 semantics — an empty listing, not an error.
+                None => Vec::new(),
+                Some(hdfs_start) => match self
+                    .client
+                    .list_status(&hdfs_start, true)
+                    .instrument(log.span.clone())
+                    .await
+                {
+                    Ok(statuses) => statuses,
+                    // The prefix's directory does not exist (or the prefix points at a
+                    // file, which the NameNode `getListing` reports the same way):
+                    // nothing can match — an empty listing, not an error. Clients probe
+                    // non-existent prefixes (e.g. `table/partition=x/` before it exists)
+                    // constantly, and real S3 answers those with an empty page.
+                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
+                    Err(e) => {
+                        return Err(
+                            log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                        )
+                    }
+                },
+            };
 
-        let page_set: std::collections::HashSet<&String> = page.iter().collect();
+            let mut entries: Vec<ListEntry> = Vec::new();
+            // NOTE: the whole bounded subtree is materialized in memory before
+            // pagination (`max_keys` is applied after sorting, never during the walk).
+            // The prefix push-down above bounds this to the requested subtree, but a
+            // huge prefix can still load a lot. A hard cap during the walk would be
+            // incorrect (hdfs-native's depth-first walk is unsorted, so stopping early
+            // could miss keys that sort before what was collected, and the client
+            // would paginate forever); a correct fix needs a sorted lazy merge, which
+            // upstream does not offer. Operators on very wide roots should expose a
+            // narrow `hdfs_root` per gateway.
+            for s in statuses {
+                if s.isdir {
+                    continue; // directories are not objects
+                }
+                let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                entries.push(ListEntry {
+                    key,
+                    size: s.length as u64,
+                    modification_time: s.modification_time,
+                });
+            }
 
-        let result_contents: Vec<Object> = contents
+            // Strict lexicographic order (S3 guarantee).
+            entries.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+
+            let (mut contents, common) = list_to_contents(&entries, &prefix, delimiter);
+            let common_vec = common.into_vec();
+
+            if let Some(marker) = &start_after {
+                contents.retain(|e| &e.key > marker);
+            }
+
+            // Interleave contents and common prefixes in key order for pagination.
+            let mut all_keys: Vec<String> = contents.iter().map(|e| e.key.clone()).collect();
+            all_keys.extend(common_vec.iter().cloned());
+            all_keys.sort();
+
+            let total: Vec<String> = all_keys;
+            let take = max_keys.min(total.len());
+            let page: Vec<String> = total[..take].to_vec();
+            let is_truncated = take < total.len();
+
+            let page_set: std::collections::HashSet<&String> = page.iter().collect();
+            let page_entries: Vec<ListEntry> = contents
+                .into_iter()
+                .filter(|e| page_set.contains(&e.key))
+                .collect();
+            let page_prefixes: Vec<String> = common_vec
+                .into_iter()
+                .filter(|p| page_set.contains(p))
+                .collect();
+            let next_token = if is_truncated {
+                page.last().cloned()
+            } else {
+                None
+            };
+            (page_entries, page_prefixes, is_truncated, next_token)
+        };
+
+        let result_contents: Vec<Object> = page_entries
             .iter()
-            .filter(|e| page_set.contains(&e.key))
             .map(|e| Object {
                 key: Some(e.key.clone()),
                 size: Some(e.size as i64),
@@ -543,19 +635,12 @@ impl S3 for HdfsGateway {
             })
             .collect();
 
-        let result_prefixes: Vec<CommonPrefix> = common_vec
+        let result_prefixes: Vec<CommonPrefix> = page_prefixes
             .iter()
-            .filter(|p| page_set.contains(p))
             .map(|p| CommonPrefix {
                 prefix: Some(p.clone()),
             })
             .collect();
-
-        let next_token = if is_truncated {
-            page.last().map(|k| encode_token(k))
-        } else {
-            None
-        };
 
         let output = ListObjectsV2Output {
             name: Some(self.mapper.bucket().to_string()),
@@ -574,8 +659,8 @@ impl S3 for HdfsGateway {
                 Some(result_prefixes)
             },
             continuation_token: input.continuation_token,
-            next_continuation_token: next_token,
-            key_count: Some((page.len()) as i32),
+            next_continuation_token: next_token.as_ref().map(|k| encode_token(k)),
+            key_count: Some((page_entries.len() + page_prefixes.len()) as i32),
             ..Default::default()
         };
         Ok(with_request_id(S3Response::new(output), &mut log))
