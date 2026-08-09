@@ -626,6 +626,87 @@ async fn list_objects_v2_large_dir() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_wide_tree_flat_pagination() {
+    // A wide, shallow tree: many directories, each with a few files. The flat
+    // (no-delimiter) listing must merge the per-directory listings in strict byte
+    // order across directory boundaries, with continuation-token pagination tiling
+    // the full key set exactly once (the lazy k-way merge path).
+    let (_scope, gateway, _client) = setup().await;
+    let mut expected: Vec<String> = Vec::new();
+    for d in 0..25 {
+        for f in 0..3 {
+            let key = format!("data/wide/dir_{d:02}/file_{f}.bin");
+            _scope.write_file(&key, b"x").await;
+            expected.push(key);
+        }
+    }
+    expected.sort();
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let resp = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/wide/".into()),
+                max_keys: Some(17),
+                continuation_token: token.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        collected.extend(
+            resp.contents
+                .unwrap_or_default()
+                .into_iter()
+                .map(|o| o.key.unwrap()),
+        );
+        match resp.next_continuation_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+    assert_eq!(
+        collected, expected,
+        "flat listing must tile the wide tree exactly once, in byte order"
+    );
+}
+
+#[tokio::test]
+async fn list_objects_v2_flat_listing_uses_utf8_byte_order() {
+    // S3 keys sort by UTF-8 bytes; HDFS lists children in Java String order,
+    // which differs for astral-plane characters (U+10000 sorts before U+E000 in
+    // Java UTF-16 code-unit order, but after it in UTF-8 byte order). The flat
+    // (no-delimiter) listing must emit S3's byte order regardless of the order
+    // the NameNode returns.
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/ord/\u{10000}.bin", b"a").await;
+    _scope.write_file("data/ord/\u{e000}.bin", b"b").await;
+
+    let resp = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some("data/ord/".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .output;
+    let keys: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["data/ord/\u{e000}.bin", "data/ord/\u{10000}.bin"],
+        "flat listing must use UTF-8 byte order, not Java String order"
+    );
+}
+
+#[tokio::test]
 async fn get_object_full_and_ranged() {
     let (_scope, gateway, _client) = setup().await;
 
