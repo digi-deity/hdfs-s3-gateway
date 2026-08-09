@@ -73,7 +73,9 @@ jobs:
         # maven is needed by MiniDfs::with_features to compile and launch the
         # embedded MiniDFSCluster Java harness; libkrb5-dev/krb5-user are needed
         # for the Kerberos integration paths and for building the krb5 Rust crate.
-        run: sudo apt-get install -y libkrb5-dev krb5-user maven
+        # apt-get update first: the ubuntu-latest image's preloaded apt lists can
+        # be stale/invalid, which makes a bare install fail (mirrors python-test).
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev krb5-user maven
 
       - name: Set up JDK
         # Use Java 17, matching the version validated by the upstream hdfs-native
