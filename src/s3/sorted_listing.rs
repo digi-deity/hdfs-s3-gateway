@@ -14,6 +14,11 @@
 //! - A continuation `after` marker skips every key `<= after` (byte order), the
 //!   same rule the old code applied via `contents.retain(|e| &e.key > marker)`.
 //! - Directories are never emitted as objects; they are only descended into.
+//! - On a resumed page, a directory whose entire key range sorts before the
+//!   `after` marker is never opened: every child of `dir` has key
+//!   `dir + "/" + name`, so `dir + "/" < after` (with `after` not living under
+//!   `dir/`) proves no child can exceed the marker. The marker's own directory
+//!   and its ancestors are still re-walked — their children straddle the marker.
 //! - `max_keys` bounds the returned page; `is_truncated` reports whether at least
 //!   one more key exists after the page.
 //!
@@ -120,6 +125,35 @@ impl Ord for Cursor {
     }
 }
 
+/// True when every possible child key of `dir_key` (keys of the form
+/// `dir_key + "/" + name`) sorts strictly before `after`, so the directory can
+/// contribute no emittable key and may be skipped without listing it.
+///
+/// This is exactly `dir_key + "/" < after && !after.starts_with(dir_key + "/")`
+/// (the smallest possible child is `dir_key + "/"`), computed without
+/// allocating. The `starts_with` half matters: marker `ab` with directory `a` —
+/// children `a/...` sort before `ab` because `/` (0x2F) < `b`, so the directory
+/// is skippable even though the marker extends its key.
+fn dir_children_all_before(dir_key: &str, after: &str) -> bool {
+    let key = dir_key.as_bytes();
+    let marker = after.as_bytes();
+    let common = key.len().min(marker.len());
+    match key[..common].cmp(&marker[..common]) {
+        // Differ within the directory's own key: every child compares the same
+        // way as `dir_key + "/"` vs `after`.
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        // Equal prefixes: the decision is at `dir_key.len()` — the child's `/`
+        // vs the marker's byte. A byte greater than `/` (e.g. `ab`, `aX`) puts
+        // every child before the marker; `/` itself means the marker lives
+        // under the directory (children straddle it); a marker that is equal to
+        // the directory key or a strict prefix of it sorts before its children.
+        Ordering::Equal if key.len() == marker.len() => false,
+        Ordering::Equal if key.len() < marker.len() => marker[key.len()] > b'/',
+        Ordering::Equal => false,
+    }
+}
+
 /// A lazy, sorted k-way merge over per-directory listings.
 ///
 /// The start directory's listing is fetched on the first pull; every directory is
@@ -203,12 +237,24 @@ impl SortedListing {
 
             if entry.isdir {
                 // Directories are never objects; descend into them (lazily, one
-                // RPC) unless no key under them can match the prefix.
+                // RPC) unless no key under them can match the prefix, or the
+                // continuation marker provably lies past their whole key range.
                 let Some(key) = self.mapper.hdfs_path_to_key(&entry.path) else {
                     continue;
                 };
                 if !key.starts_with(&self.prefix) {
                     continue;
+                }
+                // Children keys are `key + "/" + name`, so the smallest possible
+                // child is `key + "/"`. If that already sorts after the marker
+                // while the marker does not live under `key/`, every child is
+                // <= marker: the directory is dead — skip it without an RPC
+                // instead of listing it and discarding every entry (the whole
+                // subtree is re-walked on every resumed page otherwise).
+                if let Some(after) = &self.after {
+                    if dir_children_all_before(&key, after) {
+                        continue;
+                    }
                 }
                 match self.lister.list_dir(entry.path.clone()).await {
                     Ok(statuses) => self.push_dir(statuses),
@@ -475,6 +521,113 @@ mod tests {
             collected, full,
             "pages must tile the sorted listing exactly"
         );
+    }
+
+    #[tokio::test]
+    async fn resume_skips_directories_entirely_before_marker() {
+        // Page 1 served a/1.txt, b/1.txt, c/1.txt (marker `c/1.txt`). On resume,
+        // a/ and b/ provably contain only keys <= the marker, so they must not be
+        // opened: the only listings are the root and the marker's own directory.
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([
+                (
+                    "/data".into(),
+                    vec![dir("/data/a"), dir("/data/b"), dir("/data/c")],
+                ),
+                ("/data/a".into(), vec![file("/data/a/1.txt")]),
+                ("/data/b".into(), vec![file("/data/b/1.txt")]),
+                (
+                    "/data/c".into(),
+                    vec![file("/data/c/1.txt"), file("/data/c/2.txt")],
+                ),
+            ]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs.clone(), "", Some("c/1.txt".into()));
+        let (page, truncated) = listing.collect_page(100).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(keys(&page), vec!["c/2.txt"]);
+        let listed = fs.listed.lock().unwrap();
+        assert!(listed.contains(&"/data".to_string()));
+        assert!(listed.contains(&"/data/c".to_string()));
+        assert!(
+            !listed.iter().any(|d| d == "/data/a" || d == "/data/b"),
+            "directories wholly before the marker must not be listed, got: {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_inside_directory_still_lists_it() {
+        // Marker `b/1.txt` lies inside b/'s key range: b's children straddle it
+        // (b/2.txt must be emitted), so /data/b must still be opened. a/ is
+        // wholly before the marker and stays skipped.
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([
+                (
+                    "/data".into(),
+                    vec![dir("/data/a"), dir("/data/b"), dir("/data/c")],
+                ),
+                ("/data/a".into(), vec![file("/data/a/1.txt")]),
+                (
+                    "/data/b".into(),
+                    vec![file("/data/b/1.txt"), file("/data/b/2.txt")],
+                ),
+                ("/data/c".into(), vec![file("/data/c/1.txt")]),
+            ]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs.clone(), "", Some("b/1.txt".into()));
+        let (page, truncated) = listing.collect_page(100).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(keys(&page), vec!["b/2.txt", "c/1.txt"]);
+        let listed = fs.listed.lock().unwrap();
+        assert!(listed.contains(&"/data/b".to_string()));
+        assert!(
+            !listed.iter().any(|d| d == "/data/a"),
+            "a/ is wholly before the marker, got: {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_under_sibling_file_still_skips_directory() {
+        // The subtle case: marker `ab` (a root file) extends the directory key
+        // `a`, yet every child `a/...` sorts before `ab` ('/' 0x2F < 'b' 0x62).
+        // The directory must be skipped, not listed — only the root is opened.
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([
+                ("/data".into(), vec![dir("/data/a"), file("/data/ab")]),
+                ("/data/a".into(), vec![file("/data/a/1.txt")]),
+            ]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs.clone(), "", Some("ab".into()));
+        let (page, truncated) = listing.collect_page(100).await.unwrap();
+        assert!(!truncated);
+        assert!(page.is_empty()); // a/1.txt and ab itself are <= the marker
+        let listed = fs.listed.lock().unwrap();
+        assert_eq!(
+            listed.as_slice(),
+            &["/data".to_string()],
+            "only the root may be listed"
+        );
+    }
+
+    #[test]
+    fn dir_children_all_before_cases() {
+        // The predicate is exact: skip only when every child (`key + "/" + name`)
+        // sorts before the marker.
+        assert!(dir_children_all_before("a", "b/1.txt")); // decided within the key
+        assert!(dir_children_all_before("a", "ab")); // '/' < 'b' at the boundary
+        assert!(dir_children_all_before("a", "aX")); // '/' < 'X'
+        assert!(dir_children_all_before("a", "a0")); // '/' < '0' (0x30)
+        assert!(!dir_children_all_before("a", "a.")); // '.' (0x2E) < '/': children sort after
+        assert!(!dir_children_all_before("a", "a")); // marker == dir key
+        assert!(!dir_children_all_before("a", "a/")); // marker under the dir: straddle
+        assert!(!dir_children_all_before("a", "a/1.txt")); // straddle
+        assert!(!dir_children_all_before("ab", "a")); // marker prefix of dir key
+        assert!(!dir_children_all_before("b", "aZ")); // dir sorts after the marker
+        assert!(!dir_children_all_before("a", "")); // empty marker
+        assert!(dir_children_all_before("ab", "ac")); // decided within the key
     }
 
     #[tokio::test]
