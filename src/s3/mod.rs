@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::core::{
-    decode_token, encode_token, list_to_contents, paginate, ListEntry, ObjectMetadata, PathMapper,
-};
+use crate::core::{decode_token, encode_token, paginate, ListEntry, ObjectMetadata, PathMapper};
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
@@ -185,6 +183,8 @@ mod error;
 pub use error::map_hdfs_error;
 pub mod backpressure;
 pub mod server;
+mod sorted_listing;
+use self::sorted_listing::{DirLister, HdfsDirLister, SortedListing};
 mod write_policy;
 
 /// Error produced while streaming a GET response body.
@@ -441,7 +441,8 @@ impl S3 for HdfsGateway {
         // Pagination: resume after the decoded continuation token. A token that does
         // not decode is a client error (`InvalidToken`, matching AWS S3) — silently
         // falling back to the first page would make a client with a corrupted or
-        // truncated token poll page 1 forever.
+        // truncated token poll page 1 forever. Decoded up front so both listing
+        // strategies below can skip already-served keys without materializing them.
         let start_after = match input.continuation_token.as_deref() {
             Some(token) => {
                 Some(decode_token(token).ok_or_else(|| log.attach(s3_error!(InvalidToken)))?)
@@ -524,101 +525,40 @@ impl S3 for HdfsGateway {
                 page.next_token,
             )
         } else {
-            // --- No-delimiter path: flat listing of every key under the prefix. ---
-            // Push the directory portion of `prefix` down to HDFS so the recursive walk
-            // is bounded to the requested subtree instead of the entire `hdfs_root`
-            // (previously: one `getListing` RPC per directory of the whole root, including
-            // directories the caller never asked about — which also generated a flood of
-            // AccessControlExceptions on wide roots with unreadable directories).
-            // `list_to_contents` below still filters with the full `prefix`, so the result
-            // is identical — only the walk is bounded.
-            let statuses = match self.mapper.list_start(&prefix) {
-                // The prefix cannot match any key under the root (e.g. it escapes it):
-                // S3 semantics — an empty listing, not an error.
-                None => Vec::new(),
-                Some(hdfs_start) => match self
-                    .client
-                    .list_status(&hdfs_start, true)
-                    .instrument(log.span.clone())
-                    .await
-                {
-                    Ok(statuses) => statuses,
-                    // The prefix's directory does not exist (or the prefix points at a
-                    // file, which the NameNode `getListing` reports the same way):
-                    // nothing can match — an empty listing, not an error. Clients probe
-                    // non-existent prefixes (e.g. `table/partition=x/` before it exists)
-                    // constantly, and real S3 answers those with an empty page.
-                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
-                    Err(e) => {
-                        return Err(
-                            log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
-                        )
-                    }
-                },
+            // --- No-delimiter path (flat listing): lazy sorted k-way merge ---
+            // The flat listing used to walk the whole bounded subtree per
+            // request (one `getListing` RPC per directory) and materialize it
+            // before paging — re-paying the full walk on every continuation
+            // page. Instead, per-directory listings are merged lazily in key
+            // order (see `sorted_listing`): only the directories that sort
+            // before the page boundary are opened, memory is bounded to the
+            // merge frontier, and page 1 of a huge subtree costs only what
+            // `max_keys` actually needs.
+            let (page_entries, is_truncated) = match self.mapper.list_start(&prefix) {
+                // The prefix cannot match any key under the root (e.g. it escapes
+                // it): S3 semantics — an empty listing, not an error.
+                None => (Vec::new(), false),
+                Some(hdfs_start) => {
+                    let lister: Arc<dyn DirLister> =
+                        Arc::new(HdfsDirLister::new(self.client.clone(), log.span.clone()));
+                    let mut listing = SortedListing::new(
+                        lister,
+                        hdfs_start,
+                        prefix.clone(),
+                        start_after.clone(),
+                        self.mapper.clone(),
+                    );
+                    listing.collect_page(max_keys).await.map_err(|e| {
+                        log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                    })?
+                }
             };
-
-            let mut entries: Vec<ListEntry> = Vec::new();
-            // NOTE: the whole bounded subtree is materialized in memory before
-            // pagination (`max_keys` is applied after sorting, never during the walk).
-            // The prefix push-down above bounds this to the requested subtree, but a
-            // huge prefix can still load a lot. A hard cap during the walk would be
-            // incorrect (hdfs-native's depth-first walk is unsorted, so stopping early
-            // could miss keys that sort before what was collected, and the client
-            // would paginate forever); a correct fix needs a sorted lazy merge, which
-            // upstream does not offer. Operators on very wide roots should expose a
-            // narrow `hdfs_root` per gateway.
-            for s in statuses {
-                if s.isdir {
-                    continue; // directories are not objects
-                }
-                let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
-                    continue;
-                };
-                if key.is_empty() {
-                    continue;
-                }
-                entries.push(ListEntry {
-                    key,
-                    size: s.length as u64,
-                    modification_time: s.modification_time,
-                });
-            }
-
-            // Strict lexicographic order (S3 guarantee).
-            entries.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
-
-            let (mut contents, common) = list_to_contents(&entries, &prefix, delimiter);
-            let common_vec = common.into_vec();
-
-            if let Some(marker) = &start_after {
-                contents.retain(|e| &e.key > marker);
-            }
-
-            // Interleave contents and common prefixes in key order for pagination.
-            let mut all_keys: Vec<String> = contents.iter().map(|e| e.key.clone()).collect();
-            all_keys.extend(common_vec.iter().cloned());
-            all_keys.sort();
-
-            let total: Vec<String> = all_keys;
-            let take = max_keys.min(total.len());
-            let page: Vec<String> = total[..take].to_vec();
-            let is_truncated = take < total.len();
-
-            let page_set: std::collections::HashSet<&String> = page.iter().collect();
-            let page_entries: Vec<ListEntry> = contents
-                .into_iter()
-                .filter(|e| page_set.contains(&e.key))
-                .collect();
-            let page_prefixes: Vec<String> = common_vec
-                .into_iter()
-                .filter(|p| page_set.contains(p))
-                .collect();
             let next_token = if is_truncated {
-                page.last().cloned()
+                page_entries.last().map(|e| e.key.clone())
             } else {
                 None
             };
-            (page_entries, page_prefixes, is_truncated, next_token)
+            (page_entries, Vec::new(), is_truncated, next_token)
         };
 
         let result_contents: Vec<Object> = page_entries
