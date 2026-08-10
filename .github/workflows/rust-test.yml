@@ -46,6 +46,12 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      - name: Run error propagation tests
+        # `map_hdfs_error` mapping + request-id log correlation. Needs NO MiniDFS
+        # cluster (the async case points the gateway at an unreachable NameNode),
+        # so it runs in the plain build job on every OS.
+        run: cargo test --test error_propagation -- --test-threads=1
+
   test-integration:
     strategy:
       fail-fast: false
