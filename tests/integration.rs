@@ -515,17 +515,18 @@ async fn list_objects_v2_prefix_pointing_at_file_is_empty() {
 }
 
 #[tokio::test]
-async fn list_objects_v2_prefix_bounds_hdfs_walk() {
-    // The S3 `prefix` must be pushed down to HDFS: a LIST of a subtree must not
-    // walk (and fail on) directories outside it. We seed an unreadable directory at
-    // the scope root, then list a different subtree as an unprivileged user. If the
-    // gateway walked the whole root, the recursive `list_status` would hit the
-    // unreadable directory and abort with AccessControlException (→ 403); with the
-    // bounded walk it never sees it and returns the requested subtree normally.
+async fn list_objects_v2_unreadable_subdirectory_is_skipped() {
+    // Best-effort listing semantics: a directory the gateway's HDFS user cannot
+    // read must NOT fail the whole ListObjectsV2. The flat walk pops it, cannot
+    // list it (AccessControlException), skips it (logged server-side), and still
+    // serves every readable key. Only the prefix's OWN directory being unreadable
+    // answers 403 AccessDenied (matching S3) — an empty page would hide the
+    // permission problem.
     let scope = TestScope::new().await;
     scope.write_file("data/a.txt", b"a").await;
 
-    // An unreadable directory at the root (mode 000, owned by the superuser).
+    // An unreadable directory at the root (mode 000, owned by the superuser), so
+    // `nobody` can see its name in the parent listing but cannot enter it.
     let forbidden = format!("{}/forbidden", scope.root);
     let super_client = ClientBuilder::new()
         .with_url(&scope.config().namenode_uri)
@@ -537,31 +538,41 @@ async fn list_objects_v2_prefix_bounds_hdfs_walk() {
         .await
         .unwrap();
 
-    // Sanity: a full-root listing as `nobody` must be denied (the walk would hit
-    // the unreadable directory) — proving the fixture actually blocks traversal.
     let gateway = scope.gateway_as("nobody");
-    let err = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
+    let list = |prefix: Option<&str>| {
+        gateway.list_objects_v2(req(ListObjectsV2Input {
             bucket: "hdfs".into(),
+            prefix: prefix.map(String::from),
             ..Default::default()
         }))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:?}").contains("AccessDenied"),
-        "full-root listing as nobody must be denied by the unreadable dir: {err:?}"
+    };
+
+    // A full-root listing walks past `forbidden`: it must succeed and return
+    // everything that IS readable, skipping the unreadable subtree.
+    let resp = list(None).await.unwrap().output;
+    let keys: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["data/a.txt".to_string()],
+        "unreadable subtrees must be skipped, not fatal"
     );
 
-    // A prefix-bounded listing of the readable subtree must succeed and return it.
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
+    // A prefix whose OWN directory is unreadable still answers 403 AccessDenied:
+    // there is nothing to serve, and S3 semantics say deny rather than lie with
+    // an empty page.
+    let err = list(Some("forbidden/")).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AccessDenied"),
+        "prefix rooted in an unreadable directory must be denied: {err:?}"
+    );
+
+    // A prefix-bounded listing of the readable subtree returns it normally.
+    let resp = list(Some("data/")).await.unwrap().output;
     let keys: Vec<String> = resp
         .contents
         .unwrap_or_default()

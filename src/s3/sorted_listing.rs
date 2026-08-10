@@ -10,7 +10,10 @@
 //! Correctness contract (equivalences with the old walk-everything behaviour):
 //!
 //! - The emitted keys are exactly the files under the start directory whose key
-//!   matches `prefix`, in strict UTF-8 binary order, each exactly once.
+//!   matches `prefix`, in strict UTF-8 binary order, each exactly once — except
+//!   subtrees that cannot be listed: a directory that vanished mid-walk or that
+//!   the gateway's HDFS user has no permission to read is skipped (best effort;
+//!   the rest of the listing is still served, see `next_entry`).
 //! - A continuation `after` marker skips every key `<= after` (byte order), the
 //!   same rule the old code applied via `contents.retain(|e| &e.key > marker)`.
 //! - Directories are never emitted as objects; they are only descended into.
@@ -45,6 +48,23 @@ use hdfs_native::{Client, HdfsError};
 use tracing::Instrument;
 
 use crate::core::{ListEntry, PathMapper};
+use crate::s3::error::is_access_denied;
+
+/// True when `err` means "the gateway's HDFS user has no permission to read this
+/// specific directory": the NameNode rejected the `getListing` RPC with an
+/// access-control exception class (POSIX/ACL denial on the directory).
+///
+/// Only RPC-level access-control denials qualify. SASL/GSSAPI failures are NOT
+/// included: they mean the gateway cannot authenticate to the cluster at all —
+/// that is not per-directory, and swallowing it would turn a broken-auth cluster
+/// into silently truncated listings.
+fn is_dir_denied(err: &HdfsError) -> bool {
+    matches!(
+        err,
+        HdfsError::RPCError(exception, _) | HdfsError::FatalRPCError(exception, _)
+            if is_access_denied(exception)
+    )
+}
 
 /// Abstraction over "list one directory, non-recursively", so the merge can be
 /// unit-tested against an in-memory fake instead of a live cluster.
@@ -197,15 +217,25 @@ impl SortedListing {
 
     /// Yield the next matching key in byte order, or `None` when exhausted.
     ///
-    /// Error semantics:
+    /// Error semantics (best effort, never silently incomplete):
     /// - the start directory missing (`FileNotFound`) is an empty listing, not an
     ///   error — S3 answers probes of non-existent prefixes with an empty page;
     /// - a subdirectory that vanished mid-walk (`FileNotFound` between the parent
     ///   listing and ours) is skipped — the old recursive walk surfaced that as an
     ///   error which the s3 layer mapped to a silently *empty* listing, dropping
     ///   everything else; skipping only the vanished directory is strictly better;
-    /// - any other error (e.g. `AccessControlException` on a popped directory)
-    ///   propagates to the caller, matching the old behaviour.
+    /// - a subdirectory the gateway's HDFS user cannot read (NameNode
+    ///   access-control exception) is skipped the same way — the merge continues
+    ///   and every readable key is still served, with a `warn` logged server-side.
+    ///   Directories are never objects, so there is nothing to surface for the
+    ///   denied subtree itself; it is simply absent from the listing;
+    /// - the start directory itself failing with anything but `FileNotFound`
+    ///   (including access-denied) propagates: if the requested prefix's own
+    ///   directory cannot be listed there is nothing to serve, and S3 semantics
+    ///   say answer with 403 `AccessDenied`, not a misleading empty page;
+    /// - any other error (e.g. transient IO failure on a popped directory)
+    ///   propagates to the caller — a subtree must not silently disappear from a
+    ///   listing the client will believe is complete.
     async fn next_entry(&mut self) -> Result<Option<ListEntry>, HdfsError> {
         if self.exhausted {
             return Ok(None);
@@ -258,6 +288,17 @@ impl SortedListing {
                 }
                 match self.lister.list_dir(entry.path.clone()).await {
                     Ok(statuses) => self.push_dir(statuses),
+                    // Unreadable directory: skip it and keep merging. Best effort —
+                    // the client gets every key it can see; the denied subtree is
+                    // absent (and visible to operators via the warn log).
+                    Err(e) if is_dir_denied(&e) => {
+                        tracing::warn!(
+                            dir = %entry.path,
+                            error = %e,
+                            "skipping directory without read permission during flat listing"
+                        );
+                        continue;
+                    }
                     Err(HdfsError::FileNotFound(_)) => continue, // vanished mid-walk
                     Err(e) => return Err(e),
                 }
@@ -324,6 +365,8 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum FakeErr {
         NotFound,
+        /// An upstream NameNode access-control denial (e.g. `AccessControlException`).
+        Denied,
         Other,
     }
 
@@ -346,6 +389,10 @@ mod tests {
                 fs.listed.lock().unwrap().push(dir.clone());
                 match fs.errors.get(&dir).copied() {
                     Some(FakeErr::NotFound) => Err(HdfsError::FileNotFound(dir)),
+                    Some(FakeErr::Denied) => Err(HdfsError::RPCError(
+                        "org.apache.hadoop.security.AccessControlException".into(),
+                        format!("Permission denied: user=gw, path={dir}"),
+                    )),
                     Some(FakeErr::Other) => Err(HdfsError::InternalError("boom".into())),
                     None => Ok(fs.children.get(&dir).cloned().unwrap_or_default()),
                 }
@@ -666,6 +713,68 @@ mod tests {
         let (page, truncated) = listing.collect_page(100).await.unwrap();
         assert!(!truncated);
         assert_eq!(keys(&page), vec!["a.txt", "d.txt"]);
+    }
+
+    #[tokio::test]
+    async fn unreadable_subdirectory_is_skipped_not_fatal() {
+        // THE permission story: the gateway's HDFS user cannot read `b/` (the
+        // NameNode answers `getListing(b)` with AccessControlException). The flat
+        // listing must still serve everything else — a single unreadable subtree
+        // must not fail the whole ListObjectsV2 (and the directory itself is
+        // never an object, so there is nothing to surface for it).
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([
+                (
+                    "/data".into(),
+                    vec![file("/data/a.txt"), dir("/data/b"), file("/data/d.txt")],
+                ),
+                ("/data/b".into(), vec![file("/data/b/1.txt")]),
+            ]),
+            errors: HashMap::from([("/data/b".into(), FakeErr::Denied)]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs, "", None);
+        let (page, truncated) = listing.collect_page(100).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(keys(&page), vec!["a.txt", "d.txt"]);
+    }
+
+    #[tokio::test]
+    async fn unreadable_subdirectory_after_skipped_files_still_continues() {
+        // The denied directory sorts between two readable files: the merge pops
+        // it mid-page, skips it, and still yields the files after it.
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([
+                (
+                    "/data".into(),
+                    vec![file("/data/a.txt"), dir("/data/b"), file("/data/c.txt")],
+                ),
+                ("/data/b".into(), vec![file("/data/b/1.txt")]),
+            ]),
+            errors: HashMap::from([("/data/b".into(), FakeErr::Denied)]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs, "", None);
+        let (page, truncated) = listing.collect_page(100).await.unwrap();
+        assert!(!truncated);
+        assert_eq!(keys(&page), vec!["a.txt", "c.txt"]);
+    }
+
+    #[tokio::test]
+    async fn unreadable_start_directory_still_propagates() {
+        // The start directory is the prefix's own directory. If IT cannot be
+        // listed there is nothing to serve, and S3 semantics say answer with 403
+        // AccessDenied — not a misleading empty page that hides the problem.
+        let fs = Arc::new(FakeFs {
+            children: HashMap::from([("/data".into(), vec![file("/data/a.txt")])]),
+            errors: HashMap::from([("/data".into(), FakeErr::Denied)]),
+            ..Default::default()
+        });
+        let mut listing = new_listing(fs, "", None);
+        let err = listing.collect_page(100).await.unwrap_err();
+        assert!(
+            matches!(err, HdfsError::RPCError(exception, _) if exception.ends_with("AccessControlException"))
+        );
     }
 
     #[tokio::test]

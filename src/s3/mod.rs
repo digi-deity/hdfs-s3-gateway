@@ -460,6 +460,12 @@ impl S3 for HdfsGateway {
             // recursive walk (one `getListing` RPC per directory of the subtree) would
             // be pure waste, so list exactly the one directory (`recursive = false`).
             //
+            // Permission semantics: subdirectories are never entered, and the parent
+            // listing carries a child's name without needing access to the child — so
+            // an unpermissioned subdirectory still surfaces as a CommonPrefix and is
+            // simply never opened. Only the prefix's own directory being unreadable
+            // fails the request (403 AccessDenied, matching S3).
+            //
             // Semantic note: an EMPTY HDFS directory is a real directory, so it now
             // appears as a CommonPrefix. A recursive walk used to hide empty
             // directories (only files became entries), but detecting emptiness would

@@ -42,7 +42,11 @@ use s3s::{s3_error, S3Error, S3ErrorCode};
 /// `RPCError`/`FatalRPCError` whose first field is the fully-qualified Java exception class.
 /// Matching on the class name lets us translate it to S3 `AccessDenied` (403) rather than a
 /// misleading `InternalError` (500).
-fn is_access_denied(exception: &str) -> bool {
+///
+/// `pub(crate)` because the flat-listing merge (`sorted_listing`) reuses the same
+/// classification to skip unreadable subdirectories best-effort instead of failing the
+/// whole ListObjectsV2.
+pub(crate) fn is_access_denied(exception: &str) -> bool {
     exception.ends_with("AccessControlException")
         || exception.ends_with("AuthorizationException")
         || exception.ends_with("AccessDeniedException")
