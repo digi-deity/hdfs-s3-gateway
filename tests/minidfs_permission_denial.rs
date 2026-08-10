@@ -10,7 +10,8 @@
 //!
 //! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow).
 
-use hdfs_native::ClientBuilder;
+use bytes::Bytes;
+use hdfs_native::{ClientBuilder, WriteOptions};
 use hdfs_s3_gateway::s3::HdfsGateway;
 use s3s::dto::*;
 use s3s::{S3Request, S3};
@@ -103,4 +104,85 @@ async fn owner_can_still_read_after_chmod() {
         .await
         .unwrap();
     assert_eq!(resp.output.content_length, Some(4));
+}
+
+#[tokio::test]
+async fn deeper_path_under_unreadable_ancestor_is_denied_by_traverse_check() {
+    // Boundary of the "list what you know" capability: the gateway resolves a
+    // prefix's own directory and RPCs it DIRECTLY — it never requires the parent to
+    // be readable, so a known deeper path is always attempted as-is. But HDFS POSIX
+    // semantics enforce EXECUTE permission on every ancestor for any operation on a
+    // path, so a directory under an unreadable ancestor is unreachable even when the
+    // deeper directory itself grants full rights to the user. The NameNode answers
+    // AccessControlException, and the gateway must surface it as 403 AccessDenied —
+    // not as an empty listing (which would lie) and not as an InternalError.
+    //
+    // This is HDFS's rule, not the gateway's: there is no "no rights on the parent,
+    // rights deeper" case in real HDFS that a fallback could serve. Pin it so a
+    // future "walk ancestors to discover the prefix" change cannot silently break it.
+    let _ = env_logger::builder().is_test(true).try_init();
+    let scope = TestScope::new().await;
+
+    // Seed `forbidden/inner` as the superuser: the parent is 000, but the inner
+    // directory is owned by `nobody` with full rights (0777) — the maximal version
+    // of the "I know this deeper path and it is mine" scenario.
+    let forbidden = format!("{}/forbidden", scope.root);
+    let inner = format!("{forbidden}/inner");
+    let super_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .build()
+        .unwrap();
+    super_client.mkdirs(&forbidden, 0o000, true).await.unwrap();
+    super_client.mkdirs(&inner, 0o777, true).await.unwrap();
+    super_client
+        .set_owner(&inner, Some("nobody"), Some("nobody"))
+        .await
+        .unwrap();
+    // A leaf file inside the user-owned directory, created by the superuser.
+    let leaf = format!("{inner}/leaf.txt");
+    let mut writer = super_client
+        .create(&leaf, &WriteOptions::default().overwrite(true))
+        .await
+        .unwrap();
+    writer
+        .write_bytes(Bytes::copy_from_slice(b"deep"))
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // Sanity via the HDFS client itself: even `getFileInfo` on the deeper path is
+    // denied for `nobody` — the NameNode's traverse check fires before anything
+    // else. (This is the crux: no gateway fallback could do better.)
+    let nobody_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .with_user("nobody".to_string())
+        .build()
+        .unwrap();
+    let err = nobody_client.get_file_info(&inner).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AccessControlException"),
+        "HDFS must deny the deeper path via the ancestor traverse check: {err:?}"
+    );
+
+    // Through the gateway: listing the KNOWN deeper prefix must be 403 AccessDenied
+    // (the NameNode's answer, mapped faithfully) — not an empty page.
+    let gateway = gateway_as(&scope, "nobody");
+    for prefix in [
+        Some("forbidden/inner/".to_string()),
+        Some("forbidden/inner/leaf.txt".to_string()),
+    ] {
+        let err = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.contains("AccessDenied"),
+            "known deeper prefix under an unreadable ancestor must be 403, got: {dbg}"
+        );
+    }
 }
