@@ -117,9 +117,12 @@ async fn deeper_path_under_unreadable_ancestor_is_denied_by_traverse_check() {
     // AccessControlException, and the gateway must surface it as 403 AccessDenied —
     // not as an empty listing (which would lie) and not as an InternalError.
     //
-    // This is HDFS's rule, not the gateway's: there is no "no rights on the parent,
-    // rights deeper" case in real HDFS that a fallback could serve. Pin it so a
-    // future "walk ancestors to discover the prefix" change cannot silently break it.
+    // This is HDFS's rule, not the gateway's: when the ancestor grants NO access
+    // at all (not even execute), the deeper path is unreachable and no fallback
+    // could serve it — the gateway must surface the NameNode's denial faithfully
+    // as 403, not as an empty page. (The complementary boundary — an ancestor that
+    // grants execute-only, where a KNOWN deeper path IS reachable — is covered by
+    // `known_deeper_path_under_traverse_only_parent_is_listable`.)
     let _ = env_logger::builder().is_test(true).try_init();
     let scope = TestScope::new().await;
 
@@ -185,4 +188,124 @@ async fn deeper_path_under_unreadable_ancestor_is_denied_by_traverse_check() {
             "known deeper prefix under an unreadable ancestor must be 403, got: {dbg}"
         );
     }
+}
+
+#[tokio::test]
+async fn known_deeper_path_under_traverse_only_parent_is_listable() {
+    // The real-world "I know the path" scenario: the outer directory grants
+    // EXECUTE but not READ (mode 0111 — traverse-only). You cannot list the outer
+    // directory (discovery is impossible), but you CAN pass through it to a known
+    // inner path that grants you rights. The gateway must not stand in the way:
+    // every operation RPCs the exact resolved path, so the known inner prefix is
+    // served by the NameNode as-is, while listing the outer prefix itself is a
+    // faithful 403.
+    let _ = env_logger::builder().is_test(true).try_init();
+    let scope = TestScope::new().await;
+
+    // `outer`: execute-only, owned by the superuser — unreadable to `nobody`.
+    // `outer/inner`: owned by `nobody` with full rights; contains a leaf file.
+    let outer = format!("{}/outer", scope.root);
+    let inner = format!("{outer}/inner");
+    let super_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .build()
+        .unwrap();
+    super_client.mkdirs(&outer, 0o755, true).await.unwrap();
+    super_client.set_permission(&outer, 0o111).await.unwrap();
+    super_client.mkdirs(&inner, 0o777, true).await.unwrap();
+    super_client
+        .set_owner(&inner, Some("nobody"), Some("nobody"))
+        .await
+        .unwrap();
+    let leaf = format!("{inner}/leaf.txt");
+    let mut writer = super_client
+        .create(&leaf, &WriteOptions::default().overwrite(true))
+        .await
+        .unwrap();
+    writer
+        .write_bytes(Bytes::copy_from_slice(b"deep"))
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    // Raw-client sanity: the NameNode itself allows the deeper path and denies the
+    // outer listing — the exact asymmetry the gateway must preserve.
+    let nobody_client = ClientBuilder::new()
+        .with_url(&scope.config().namenode_uri)
+        .with_user("nobody".to_string())
+        .build()
+        .unwrap();
+    assert!(
+        nobody_client.get_file_info(&inner).await.is_ok(),
+        "traverse-only parent must still permit stat of the known inner dir"
+    );
+    assert!(
+        nobody_client.list_status(&inner, false).await.is_ok(),
+        "traverse-only parent must still permit listing the known inner dir"
+    );
+    let err = nobody_client.list_status(&outer, false).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AccessControlException"),
+        "listing the traverse-only parent itself must be denied: {err:?}"
+    );
+
+    let gateway = gateway_as(&scope, "nobody");
+    let list = |prefix: &str, delimiter: bool| {
+        gateway.list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            prefix: Some(prefix.into()),
+            delimiter: delimiter.then(|| "/".into()),
+            ..Default::default()
+        }))
+    };
+
+    // Flat listing of the KNOWN inner prefix: served, without ever touching the
+    // unreadable parent's children enumeration.
+    let resp = list("outer/inner/", false).await.unwrap().output;
+    let keys: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["outer/inner/leaf.txt".to_string()],
+        "known inner prefix must be listable through a traverse-only parent"
+    );
+
+    // Same via the delimiter path (single-level listing of the inner directory).
+    let resp = list("outer/inner/", true).await.unwrap().output;
+    let keys: Vec<String> = resp
+        .contents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|o| o.key.unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["outer/inner/leaf.txt".to_string()],
+        "delimiter listing of the known inner prefix must also work"
+    );
+
+    // The outer prefix itself is not listable → faithful 403 (both paths agree).
+    for delimiter in [false, true] {
+        let err = list("outer/", delimiter).await.unwrap_err();
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.contains("AccessDenied"),
+            "listing the unreadable parent prefix must be 403 (delimiter={delimiter}), got: {dbg}"
+        );
+    }
+
+    // And a known deep OBJECT is readable too: traversal is not limited to listings.
+    let resp = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "outer/inner/leaf.txt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.output.content_length, Some(4));
 }
