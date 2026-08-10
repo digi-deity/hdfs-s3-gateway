@@ -82,7 +82,11 @@ async fn permission_denied_maps_to_access_denied() {
 
 #[tokio::test]
 async fn owner_can_still_read_after_chmod() {
-    // Sanity: the owner (superuser) is unaffected by the restrictive mode and reads fine.
+    // The OWNER of a file is unaffected by its restrictive mode: after chmod 600
+    // the owner still reads it through the gateway. Environment-independent:
+    // `nobody` is never the HDFS superuser (the NameNode process user — `root` in
+    // local containers, `runner` in CI), while the default client always is, so
+    // the chmod/chown succeed and the read is genuinely the owner's.
     let _ = env_logger::builder().is_test(true).try_init();
     let scope = TestScope::new().await;
 
@@ -93,8 +97,12 @@ async fn owner_can_still_read_after_chmod() {
         .build()
         .unwrap();
     super_client.set_permission(&path, 0o600).await.unwrap();
+    super_client
+        .set_owner(&path, Some("nobody"), Some("nobody"))
+        .await
+        .unwrap();
 
-    let gateway = gateway_as(&scope, "root");
+    let gateway = gateway_as(&scope, "nobody");
     let resp = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
