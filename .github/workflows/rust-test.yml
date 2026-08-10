@@ -148,6 +148,9 @@ jobs:
       - name: Run integration tests (conformance)
         run: cargo test --test conformance -- --test-threads=1
 
+      - name: Run integration tests (permission denial)
+        run: cargo test --test minidfs_permission_denial -- --test-threads=1
+
       - name: Run integration tests (graceful_shutdown)
         run: cargo test --test graceful_shutdown -- --test-threads=1
 
