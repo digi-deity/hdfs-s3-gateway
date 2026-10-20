@@ -235,6 +235,7 @@ async fn upstream_error_logged_with_request_id() {
         hdfs_options: Default::default(),
         hdfs_config_dir: None,
         hdfs_user: None,
+        cache: Default::default(),
         auth_secret: None,
     };
     let client = ClientBuilder::new()

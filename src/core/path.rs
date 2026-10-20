@@ -207,6 +207,7 @@ mod tests {
             hdfs_options: Default::default(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            cache: Default::default(),
             auth_secret: None,
         };
         PathMapper::new(&config)
@@ -225,6 +226,7 @@ mod tests {
             hdfs_options: Default::default(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            cache: Default::default(),
             auth_secret: None,
         };
         PathMapper::new(&config)
