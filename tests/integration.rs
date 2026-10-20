@@ -1299,3 +1299,56 @@ async fn list_objects_v2_max_keys_edge_cases() {
         "negative max-keys must be InvalidArgument, got: {err:?}"
     );
 }
+
+#[tokio::test]
+async fn metadata_cache_ttl_bounds_staleness() {
+    // The gateway only caches metadata for a bounded time. An external writer (here the
+    // test's own HDFS client, i.e. not the gateway) overwriting the object is therefore
+    // invisible until the configured TTL expires — and visible afterwards.
+    let (scope, _gateway, client) = setup().await;
+    scope.write_file("data/cache/a.txt", b"aaaa").await;
+
+    let head_len = |gateway: HdfsGateway| async move {
+        gateway
+            .head_object(req(HeadObjectInput {
+                bucket: "hdfs".into(),
+                key: "data/cache/a.txt".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output
+            .content_length
+            .unwrap()
+    };
+
+    let mut long = scope.config();
+    long.cache.metadata_ttl_ms = 60_000;
+    let long = HdfsGateway::new(client.clone(), long);
+
+    let mut short = scope.config();
+    short.cache.metadata_ttl_ms = 200;
+    let short = HdfsGateway::new(client.clone(), short);
+
+    // Prime both caches with the 4-byte object.
+    assert_eq!(head_len(long.clone()).await, 4);
+    assert_eq!(head_len(short.clone()).await, 4);
+
+    // External overwrite (different length).
+    scope.write_file("data/cache/a.txt", b"aaaaaa").await;
+
+    // Within TTL: the cached (stale) metadata is reused.
+    assert_eq!(
+        head_len(long.clone()).await,
+        4,
+        "metadata must be cached within its TTL"
+    );
+
+    // After the short TTL the next request re-reads HDFS.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(
+        head_len(short).await,
+        6,
+        "metadata must be re-read after the TTL"
+    );
+}
