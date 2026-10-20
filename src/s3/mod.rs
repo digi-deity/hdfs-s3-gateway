@@ -16,7 +16,6 @@ use hdfs_native::ClientBuilder;
 use s3s::dto::*;
 use s3s::header::X_AMZ_REQUEST_ID;
 use s3s::{s3_error, S3Error, S3Request, S3Response, S3Result, S3};
-use tokio_util::io::ReaderStream;
 use tracing::Instrument;
 
 /// Per-process monotonic counter used to make request ids unique within a process.
@@ -203,14 +202,12 @@ enum GetBodyError {
 
 /// Enforce an exact content length on a byte stream.
 ///
-/// The HDFS reader streams from `set_position` to EOF in large chunks (the 64 KiB
-/// `ReaderStream` buffer), so a ranged GET's final chunk routinely extends past the
-/// requested window — the excess is truncated here. That is the normal contract, NOT
-/// a bug: the window's end is rarely chunk-aligned. What this wrapper detects is the
-/// opposite failure: the stream ending BEFORE `content_length` bytes were delivered
+/// The HDFS range stream already stops at the end of the requested window, so the
+/// truncation below is defensive; what this wrapper really enforces is the exact
+/// content length: a stream that ends BEFORE `content_length` bytes were delivered
 /// (a mid-stream DataNode failure surfacing as EOF, or the file shrinking between
-/// `get_file_info` and `read`), which fails the stream explicitly rather than
-/// producing a silently-truncated "successful" response.
+/// `get_file_info` and `read`) fails explicitly rather than producing a silently
+/// truncated "successful" response.
 fn bytes_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
     content_length: usize,
@@ -718,20 +715,34 @@ impl S3 for HdfsGateway {
         };
 
         // --- Streaming body (never buffer the whole object) -------------
-        let mut reader = self
+        let reader = self
             .client
             .read(&hdfs_path)
             .instrument(log.span.clone())
             .await
             .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
-        reader.set_position(window_start);
+        // One HDFS read for the whole window. Reading via AsyncRead (ReaderStream) starts a
+        // new DataNode ReadBlock op per 64 KiB buffer (~8 ms each), capping a GET at ~8 MB/s.
+        if window_end > reader.file_length() {
+            // File shrank since get_file_info; read_range_stream would panic.
+            return Err(log.attach(s3_error!(InternalError)));
+        }
         let remaining = window_end - window_start;
-
-        let stream = ReaderStream::with_capacity(reader, 64 * 1024);
-        // `bytes_stream` enforces the exact content length: the final chunk of a
-        // ranged read is truncated to the window (the HDFS reader streams in 64 KiB
-        // chunks past the range end — normal), and an upstream stream that ends
-        // early fails with a short-read error instead of a silently-short
+        let stream = reader
+            .read_range_stream(window_start, remaining)
+            .map(|r| r.map_err(std::io::Error::other))
+            .boxed();
+        // `hdfs-native`'s range stream is `Send` but not `Sync` (it is built on
+        // `BoxStream`, which erases `Sync`), while `s3s` requires the response body to be
+        // both (`StreamingBlob::wrap`). The mutex restores `Sync`; it is never contended
+        // (the body is polled by one task) and is held for a single `poll_next` only.
+        let stream = std::sync::Mutex::new(stream);
+        let stream = futures::stream::poll_fn(move |cx| {
+            let mut stream = stream.lock().unwrap_or_else(|e| e.into_inner());
+            std::pin::Pin::new(&mut *stream).poll_next(cx)
+        });
+        // `bytes_stream` enforces the exact content length: an upstream stream that
+        // ends early fails with a short-read error instead of a silently-short
         // "successful" response.
         let body = bytes_stream(stream, remaining);
 
