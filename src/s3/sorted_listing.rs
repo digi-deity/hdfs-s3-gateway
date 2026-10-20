@@ -338,11 +338,18 @@ impl SortedListing {
     /// Collect up to `max_keys` entries (the page), returning them with a flag
     /// telling whether at least one more entry exists after the page (the S3
     /// `IsTruncated` contract). The extra entry is probed lazily — one pull beyond
-    /// `max_keys` — so `max_keys = 0` still reports truncation correctly.
+    /// `max_keys` — so truncation is exact.
+    ///
+    /// `max_keys = 0` is the exception: the page is empty and NOT truncated. Probing
+    /// for an extra entry there would report truncation with no token to advance with
+    /// (and S3's reference tests assert `IsTruncated=false` for `MaxKeys=0`).
     pub async fn collect_page(
         &mut self,
         max_keys: usize,
     ) -> Result<(Vec<ListEntry>, bool), HdfsError> {
+        if max_keys == 0 {
+            return Ok((Vec::new(), false));
+        }
         let mut page = Vec::with_capacity(max_keys.min(1024));
         while page.len() < max_keys {
             match self.next_entry().await? {
@@ -811,15 +818,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_keys_zero_probes_truncation_only() {
+    async fn max_keys_zero_is_empty_and_not_truncated() {
+        // max-keys=0 asks for no keys and must NOT report truncation: an empty page has
+        // no last key to mint a continuation token from, so "truncated" would be a page
+        // the client cannot advance past (and S3's reference tests assert
+        // IsTruncated=false for MaxKeys=0).
         let fs = tree();
         let mut listing = new_listing(fs.clone(), "", None);
         let (page, truncated) = listing.collect_page(0).await.unwrap();
         assert!(page.is_empty());
-        assert!(
-            truncated,
-            "keys exist, so max_keys=0 must still report truncation"
-        );
+        assert!(!truncated);
 
         let empty = Arc::new(FakeFs::default());
         let mut listing = new_listing(empty, "", None);

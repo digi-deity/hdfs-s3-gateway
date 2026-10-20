@@ -1255,3 +1255,47 @@ async fn bucket_config_probes_not_configured() {
         .output;
     assert!(out.cors_rules.is_none(), "cors should be 'not configured'");
 }
+
+#[tokio::test]
+async fn list_objects_v2_max_keys_edge_cases() {
+    // `max-keys=0` must be an empty page that is NOT truncated (S3's reference tests
+    // assert IsTruncated=false for MaxKeys=0); reporting truncation would be a page the
+    // client cannot advance past, because no token can be minted from an empty page.
+    // A negative max-keys is a client error — the old `as usize` cast wrapped it to
+    // usize::MAX, turning "max-keys=-1" into an unbounded listing.
+    let (scope, gateway, _client) = setup().await;
+    scope.write_file("data/mkz/a.txt", b"a").await;
+    scope.write_file("data/mkz/b.txt", b"b").await;
+    scope.write_file("data/mkz/sub/c.txt", b"c").await;
+
+    for delimiter in [None, Some("/".to_string())] {
+        let out = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/mkz/".into()),
+                delimiter,
+                max_keys: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(out.is_truncated, Some(false));
+        assert!(out.contents.unwrap_or_default().is_empty());
+        assert!(out.common_prefixes.unwrap_or_default().is_empty());
+        assert!(out.next_continuation_token.is_none());
+    }
+
+    let err = gateway
+        .list_objects_v2(req(ListObjectsV2Input {
+            bucket: "hdfs".into(),
+            max_keys: Some(-1),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("InvalidArgument"),
+        "negative max-keys must be InvalidArgument, got: {err:?}"
+    );
+}

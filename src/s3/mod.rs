@@ -433,7 +433,16 @@ impl S3 for HdfsGateway {
         // keys are returned as Contents rather than collapsing every key into the
         // prefix itself (which `rest.find("")` would otherwise do at index 0).
         let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
-        let max_keys = input.max_keys.unwrap_or(1000) as usize;
+        let max_keys = match input.max_keys {
+            None => 1000,
+            // S3 rejects a negative max-keys with InvalidArgument. The previous
+            // `as usize` cast wrapped a negative value to usize::MAX, i.e. a
+            // client could turn "max-keys=-1" into an unbounded listing.
+            Some(n) if n < 0 => {
+                return Err(log.attach(s3_error!(InvalidArgument, "max-keys must not be negative")));
+            }
+            Some(n) => n as usize,
+        };
 
         // Pagination: resume after the decoded continuation token. A token that does
         // not decode is a client error (`InvalidToken`, matching AWS S3) — silently
@@ -563,6 +572,17 @@ impl S3 for HdfsGateway {
             };
             (page_entries, Vec::new(), is_truncated, next_token)
         };
+
+        // S3 contract: `IsTruncated=true` must come with a token to advance with, and
+        // `max-keys=0` must not report truncation at all (the reference S3 tests assert
+        // `IsTruncated=false` for `MaxKeys=0`, which is also the only self-consistent
+        // answer when no token can be produced). Both listing strategies already return
+        // an empty, non-truncated page for max-keys=0; this is the layer-level guarantee.
+        debug_assert!(
+            !is_truncated || next_token.is_some(),
+            "truncated page without a continuation token"
+        );
+        let is_truncated = is_truncated && next_token.is_some();
 
         let result_contents: Vec<Object> = page_entries
             .iter()
