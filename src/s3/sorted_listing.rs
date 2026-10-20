@@ -39,7 +39,7 @@
 //! This reproduces the old implementation's global `as_bytes()` sort exactly.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -47,7 +47,7 @@ use hdfs_native::client::FileStatus;
 use hdfs_native::{Client, HdfsError};
 use tracing::Instrument;
 
-use crate::core::{ListEntry, PathMapper};
+use crate::core::{cmp_dir_keys, cmp_dir_output, cmp_file_dir, DirListing, ListEntry, PathMapper};
 use crate::s3::error::is_access_denied;
 
 /// True when `err` means "the gateway's HDFS user has no permission to read this
@@ -69,10 +69,11 @@ fn is_dir_denied(err: &HdfsError) -> bool {
 /// Abstraction over "list one directory, non-recursively", so the merge can be
 /// unit-tested against an in-memory fake instead of a live cluster.
 pub trait DirLister: Send + Sync {
-    /// Non-recursive listing of `dir` (its direct children). The result may be in
-    /// any order; [`SortedListing`] re-sorts each directory's entries by raw path
-    /// bytes before merging.
-    fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Vec<FileStatus>, HdfsError>>;
+    /// Non-recursive listing of `dir` (its direct children), already mapped to S3 keys,
+    /// split by kind and sorted by key bytes ([`DirListing`]). Mapping and sorting here,
+    /// once per directory listing, is what lets pagination resume with a binary search
+    /// instead of re-scanning the directory on every page.
+    fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Arc<DirListing>, HdfsError>>;
 }
 
 /// The production lister: one non-recursive `getListing` RPC per directory.
@@ -81,48 +82,113 @@ pub trait DirLister: Send + Sync {
 /// this bounds the work to the directories the merge actually opens.
 pub struct HdfsDirLister {
     client: Arc<Client>,
+    mapper: PathMapper,
     span: tracing::Span,
 }
 
 impl HdfsDirLister {
     /// `span` is the request log span; upstream diagnostics stay correlated to the
     /// request that triggered them (same pattern as the other gateway call sites).
-    pub fn new(client: Arc<Client>, span: tracing::Span) -> Self {
-        HdfsDirLister { client, span }
+    pub fn new(client: Arc<Client>, mapper: PathMapper, span: tracing::Span) -> Self {
+        HdfsDirLister {
+            client,
+            mapper,
+            span,
+        }
     }
 }
 
 impl DirLister for HdfsDirLister {
-    fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Vec<FileStatus>, HdfsError>> {
+    fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Arc<DirListing>, HdfsError>> {
         let client = self.client.clone();
+        let mapper = self.mapper.clone();
         let span = self.span.clone();
-        Box::pin(async move { client.list_status(&dir, false).instrument(span).await })
+        Box::pin(async move {
+            let statuses = client.list_status(&dir, false).instrument(span).await?;
+            Ok(Arc::new(listing_from_statuses(statuses, &mapper)))
+        })
     }
 }
 
-/// One opened directory listing, positioned at its next entry.
+/// Map one directory's raw `FileStatus` children into a [`DirListing`] (S3-key space,
+/// split by kind, sorted by key bytes). Entries outside the configured root are dropped:
+/// they cannot be addressed by any S3 key.
+pub(crate) fn listing_from_statuses(statuses: Vec<FileStatus>, mapper: &PathMapper) -> DirListing {
+    let mut files = Vec::with_capacity(statuses.len());
+    let mut dirs = Vec::new();
+    for status in statuses {
+        let Some(key) = mapper.hdfs_path_to_key(&status.path) else {
+            continue;
+        };
+        // The root itself (a listing of `/`) has the empty key: not an object.
+        if key.is_empty() {
+            continue;
+        }
+        if status.isdir {
+            dirs.push(key);
+        } else {
+            files.push(ListEntry {
+                key,
+                size: status.length as u64,
+                modification_time: status.modification_time,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+    // Directories are ordered by their OUTPUT key (`dir + "/"`), not their raw key:
+    // sibling names can be prefixes of each other (`0` vs `0 `), which flips the
+    // comparison once the delimiter is appended. Output order is what makes the
+    // pagination bounds below monotone.
+    dirs.sort_by(|a, b| cmp_dir_keys(a, b));
+    DirListing {
+        files: files.into(),
+        dirs: dirs.into(),
+    }
+}
+
+/// A cursor over one directory's files or directories, positioned at its next
+/// un-emitted entry.
 ///
-/// Cursors in the heap always have a non-empty front; the heap orders them by the
-/// front entry's raw path bytes, so the minimum cursor holds the smallest
-/// un-emitted key in the whole frontier.
+/// The two kinds get separate cursors because their output keys order differently: a
+/// file's key is its own, while a directory's emitted key is `dir + "/"`, which sorts
+/// *after* sibling files that extend the directory's name (`a/b` vs `a/b.txt`). Resuming
+/// a single raw-key-ordered cursor by binary search would therefore skip directories
+/// whose children sort after a sibling file; per-kind cursors have monotone predicates
+/// (see `dir_children_all_before`).
 struct Cursor {
-    entries: VecDeque<FileStatus>,
+    listing: Arc<DirListing>,
+    files: bool,
+    idx: usize,
 }
 
 impl Cursor {
-    fn front_path(&self) -> &str {
-        // Invariant: only non-empty cursors are ever pushed/reinserted.
-        &self
-            .entries
-            .front()
-            .expect("heap cursors are never empty")
-            .path
+    fn len(&self) -> usize {
+        if self.files {
+            self.listing.files.len()
+        } else {
+            self.listing.dirs.len()
+        }
+    }
+
+    fn front(&self) -> &str {
+        // Invariant: a cursor is only pushed with `idx < len` and dropped when exhausted.
+        if self.files {
+            &self.listing.files[self.idx].key
+        } else {
+            &self.listing.dirs[self.idx]
+        }
+    }
+
+    /// Advance to the next entry; returns whether the cursor is still non-empty.
+    fn advance(&mut self) -> bool {
+        self.idx += 1;
+        self.idx < self.len()
     }
 }
 
 impl PartialEq for Cursor {
     fn eq(&self, other: &Self) -> bool {
-        self.front_path() == other.front_path()
+        self.front() == other.front()
     }
 }
 
@@ -136,12 +202,16 @@ impl PartialOrd for Cursor {
 
 impl Ord for Cursor {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Raw byte order, matching S3's UTF-8 binary key ordering. Paths in a real
-        // tree are unique, so ties cannot occur; comparing the front path is a
-        // total order.
-        self.front_path()
-            .as_bytes()
-            .cmp(other.front_path().as_bytes())
+        // Compare each cursor's OUTPUT key: a file's key is its own; a directory's
+        // smallest descendant key is `dir + "/"`. Sibling directory names can be
+        // prefixes of each other, so this is not raw byte order (see `cmp_dir_keys`).
+        // Keys are unique within one listing, so this is a total order.
+        match (self.files, other.files) {
+            (true, true) => self.front().as_bytes().cmp(other.front().as_bytes()),
+            (false, false) => cmp_dir_keys(self.front(), other.front()),
+            (true, false) => cmp_file_dir(self.front(), other.front()),
+            (false, true) => cmp_file_dir(other.front(), self.front()).reverse(),
+        }
     }
 }
 
@@ -154,6 +224,13 @@ impl Ord for Cursor {
 /// allocating. The `starts_with` half matters: marker `ab` with directory `a` —
 /// children `a/...` sort before `ab` because `/` (0x2F) < `b`, so the directory
 /// is skippable even though the marker extends its key.
+///
+/// NOTE: this predicate is exact per directory but NOT monotone across a listing's
+/// sibling directories: sibling names can be prefixes of each other (`0` vs `0 `), so
+/// appending the delimiter can flip their order. Resumption therefore bounds the cursor
+/// with a binary search over the directories' OUTPUT order (`cmp_dir_keys`) plus an
+/// explicit straddler adjustment (see [`SortedListing::push_listing`]), not by binary
+/// searching this predicate.
 fn dir_children_all_before(dir_key: &str, after: &str) -> bool {
     let key = dir_key.as_bytes();
     let marker = after.as_bytes();
@@ -172,6 +249,31 @@ fn dir_children_all_before(dir_key: &str, after: &str) -> bool {
         Ordering::Equal if key.len() < marker.len() => marker[key.len()] > b'/',
         Ordering::Equal => false,
     }
+}
+
+/// First index in an output-ordered directory array that can still contain a key
+/// greater than `marker`.
+///
+/// Every directory whose output key (`dir + "/"`) sorts after the marker is kept — as a
+/// suffix of the output-ordered array, so a plain `partition_point` finds its start.
+/// Exactly one extra directory can also matter: the one whose output key is a *prefix* of
+/// the marker (`marker` starts with `dir + "/"`), because its children straddle the
+/// marker. That directory, if present, is the last entry at or before the boundary
+/// (nothing else can sort between `dir + "/"` and a marker inside that subtree), so the
+/// bound is simply adjusted by one.
+fn dirs_start_after(dirs: &[String], marker: &str) -> usize {
+    let mut start = dirs.partition_point(|d| cmp_dir_output(d, marker) != Ordering::Greater);
+    if start > 0 {
+        let candidate = dirs[start - 1].as_bytes();
+        let marker = marker.as_bytes();
+        if marker.len() > candidate.len()
+            && marker.starts_with(candidate)
+            && marker[candidate.len()] == b'/'
+        {
+            start -= 1;
+        }
+    }
+    start
 }
 
 /// A lazy, sorted k-way merge over per-directory listings.
@@ -194,8 +296,8 @@ pub struct SortedListing {
 impl SortedListing {
     /// `start` is the HDFS directory the walk is bounded to (from
     /// `PathMapper::list_start`); `prefix` is the S3 prefix; `after` is the decoded
-    /// continuation marker (every key `<= after` is skipped); `mapper` converts
-    /// HDFS paths back to S3 keys.
+    /// continuation marker (every key `<= after` is skipped); `mapper` converts S3
+    /// keys back to HDFS paths when a directory is descended into.
     pub fn new(
         lister: Arc<dyn DirLister>,
         start: String,
@@ -243,7 +345,7 @@ impl SortedListing {
         if !self.start_seeded {
             self.start_seeded = true;
             match self.lister.list_dir(self.start.clone()).await {
-                Ok(statuses) => self.push_dir(statuses),
+                Ok(listing) => self.push_listing(listing),
                 Err(HdfsError::FileNotFound(_)) => {
                     self.exhausted = true;
                     return Ok(None);
@@ -253,84 +355,94 @@ impl SortedListing {
         }
 
         loop {
-            let Some(Reverse(mut cur)) = self.heap.pop() else {
+            let Some(Reverse(mut cursor)) = self.heap.pop() else {
                 self.exhausted = true;
                 return Ok(None);
             };
-            let entry = cur
-                .entries
-                .pop_front()
-                .expect("heap cursors are never empty");
-            if !cur.entries.is_empty() {
-                self.heap.push(Reverse(cur));
-            }
-
-            if entry.isdir {
-                // Directories are never objects; descend into them (lazily, one
-                // RPC) unless no key under them can match the prefix, or the
-                // continuation marker provably lies past their whole key range.
-                let Some(key) = self.mapper.hdfs_path_to_key(&entry.path) else {
-                    continue;
-                };
-                if !key.starts_with(&self.prefix) {
+            if cursor.files {
+                let entry = cursor.listing.files[cursor.idx].clone();
+                if cursor.advance() {
+                    self.heap.push(Reverse(cursor));
+                }
+                // Defence in depth: file cursors are positioned past the marker, so
+                // these checks cannot fire; they keep the emitted contract local.
+                if !entry.key.starts_with(&self.prefix) {
                     continue;
                 }
-                // Children keys are `key + "/" + name`, so the smallest possible
-                // child is `key + "/"`. If that already sorts after the marker
-                // while the marker does not live under `key/`, every child is
-                // <= marker: the directory is dead — skip it without an RPC
-                // instead of listing it and discarding every entry (the whole
-                // subtree is re-walked on every resumed page otherwise).
                 if let Some(after) = &self.after {
-                    if dir_children_all_before(&key, after) {
+                    if &entry.key <= after {
                         continue;
                     }
                 }
-                match self.lister.list_dir(entry.path.clone()).await {
-                    Ok(statuses) => self.push_dir(statuses),
-                    // Unreadable directory: skip it and keep merging. Best effort —
-                    // the client gets every key it can see; the denied subtree is
-                    // absent (and visible to operators via the warn log).
-                    Err(e) if is_dir_denied(&e) => {
-                        tracing::warn!(
-                            dir = %entry.path,
-                            error = %e,
-                            "skipping directory without read permission during flat listing"
-                        );
-                        continue;
-                    }
-                    Err(HdfsError::FileNotFound(_)) => continue, // vanished mid-walk
-                    Err(e) => return Err(e),
-                }
-                continue;
+                return Ok(Some(entry));
             }
 
-            let Some(key) = self.mapper.hdfs_path_to_key(&entry.path) else {
-                continue;
-            };
+            // Directories are never objects; descend into them (lazily, one RPC).
+            let key = cursor.listing.dirs[cursor.idx].clone();
+            if cursor.advance() {
+                self.heap.push(Reverse(cursor));
+            }
             if !key.starts_with(&self.prefix) {
                 continue;
             }
             if let Some(after) = &self.after {
-                if &key <= after {
+                if dir_children_all_before(&key, after) {
                     continue;
                 }
             }
-            return Ok(Some(ListEntry {
-                key,
-                size: entry.length as u64,
-                modification_time: entry.modification_time,
-            }));
+            let Some(hdfs_path) = self.mapper.key_to_hdfs_path(&key) else {
+                continue;
+            };
+            match self.lister.list_dir(hdfs_path.clone()).await {
+                Ok(listing) => self.push_listing(listing),
+                // Unreadable directory: skip it and keep merging. Best effort —
+                // the client gets every key it can see; the denied subtree is
+                // absent (and visible to operators via the warn log).
+                Err(e) if is_dir_denied(&e) => {
+                    tracing::warn!(
+                        dir = %hdfs_path,
+                        error = %e,
+                        "skipping directory without read permission during flat listing"
+                    );
+                    continue;
+                }
+                Err(HdfsError::FileNotFound(_)) => continue, // vanished mid-walk
+                Err(e) => return Err(e),
+            }
         }
     }
 
-    /// Push a directory's children as a fresh cursor, sorted by raw path bytes so
-    /// the heap merge yields strict UTF-8 binary order (see module docs).
-    fn push_dir(&mut self, mut statuses: Vec<FileStatus>) {
-        statuses.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-        if !statuses.is_empty() {
+    /// Push one listing's two cursors, positioned at the first entry that can still be
+    /// emitted after the continuation marker.
+    ///
+    /// - files: first key strictly greater than the marker (`partition_point` over a
+    ///   key-sorted array — monotone: a file's output key IS its key);
+    /// - directories: first directory that is not provably entirely before the marker.
+    ///   This is what keeps a directory whose own key sorts before the marker but whose
+    ///   children sort after it (`a/b` vs marker `a/b.txt`) from being skipped; the
+    ///   predicate is monotone over siblings, so no compression happens.
+    fn push_listing(&mut self, listing: Arc<DirListing>) {
+        let (files_start, dirs_start) = match &self.after {
+            Some(marker) => (
+                listing
+                    .files
+                    .partition_point(|f| f.key.as_bytes() <= marker.as_bytes()),
+                dirs_start_after(&listing.dirs, marker),
+            ),
+            None => (0, 0),
+        };
+        if files_start < listing.files.len() {
             self.heap.push(Reverse(Cursor {
-                entries: VecDeque::from(statuses),
+                listing: Arc::clone(&listing),
+                files: true,
+                idx: files_start,
+            }));
+        }
+        if dirs_start < listing.dirs.len() {
+            self.heap.push(Reverse(Cursor {
+                listing,
+                files: false,
+                idx: dirs_start,
             }));
         }
     }
@@ -390,7 +502,7 @@ mod tests {
     struct FakeLister(Arc<FakeFs>);
 
     impl DirLister for FakeLister {
-        fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Vec<FileStatus>, HdfsError>> {
+        fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Arc<DirListing>, HdfsError>> {
             let fs = Arc::clone(&self.0);
             Box::pin(async move {
                 fs.listed.lock().unwrap().push(dir.clone());
@@ -401,7 +513,10 @@ mod tests {
                         format!("Permission denied: user=gw, path={dir}"),
                     )),
                     Some(FakeErr::Other) => Err(HdfsError::InternalError("boom".into())),
-                    None => Ok(fs.children.get(&dir).cloned().unwrap_or_default()),
+                    None => Ok(Arc::new(listing_from_statuses(
+                        fs.children.get(&dir).cloned().unwrap_or_default(),
+                        &mapper(),
+                    ))),
                 }
             })
         }

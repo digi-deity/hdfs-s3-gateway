@@ -9,7 +9,8 @@ pub mod path;
 pub mod range;
 
 pub use listing::{
-    decode_token, encode_token, list_to_contents, paginate, CommonPrefixSet, ListEntry,
+    cmp_dir_keys, cmp_dir_output, cmp_file_dir, decode_token, encode_token, list_to_contents,
+    paginate, paginate_slash, CommonPrefixSet, DirListing, ListEntry,
 };
 pub use metadata::{fallback_etag, ObjectMetadata};
 pub use path::PathMapper;
