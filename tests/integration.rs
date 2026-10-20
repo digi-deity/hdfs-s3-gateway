@@ -1352,3 +1352,44 @@ async fn metadata_cache_ttl_bounds_staleness() {
         "metadata must be re-read after the TTL"
     );
 }
+
+#[tokio::test]
+async fn block_cache_is_invalidated_when_the_object_changes() {
+    // A cached block map is only reused while the object's (length, mtime) still match
+    // the freshly read metadata. Here the metadata TTL is short and the block TTL long,
+    // so the second GET sees the new metadata and MUST re-open the block map instead of
+    // serving the previous object's blocks.
+    let (scope, _gateway, client) = setup().await;
+    scope.write_file("data/cache/b.bin", b"aaaa").await;
+
+    let mut config = scope.config();
+    config.cache.metadata_ttl_ms = 50;
+    config.cache.blocks_ttl_ms = 60_000;
+    let gateway = HdfsGateway::new(client.clone(), config);
+
+    let get = |gateway: HdfsGateway| async move {
+        let out = gateway
+            .get_object(req(GetObjectInput {
+                bucket: "hdfs".into(),
+                key: "data/cache/b.bin".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        collect_body(out.body.unwrap()).await
+    };
+
+    assert_eq!(get(gateway.clone()).await, b"aaaa");
+
+    // External overwrite: different length and contents, so both the cached metadata and
+    // the cached block map are stale.
+    scope.write_file("data/cache/b.bin", b"bbbbbbbb").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        get(gateway).await,
+        b"bbbbbbbb",
+        "a stale block map must not be reused for a changed object"
+    );
+}

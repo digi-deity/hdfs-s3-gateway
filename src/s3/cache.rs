@@ -8,6 +8,10 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use hdfs_native::file::FileReader;
+
 use crate::config::CacheConfig;
 use crate::core::TtlCache;
 
@@ -17,6 +21,16 @@ use crate::core::TtlCache;
 pub struct FileMeta {
     pub length: u64,
     pub isdir: bool,
+    pub modification_time: u64,
+}
+
+/// A cached block map (`FileReader`) plus the identity it was opened for. A GET reuses it
+/// only while the freshly read (length, mtime) still match, so a replaced file with the
+/// same name can never be served from the old block map.
+#[derive(Clone)]
+pub struct CachedReader {
+    pub reader: Arc<FileReader>,
+    pub length: u64,
     pub modification_time: u64,
 }
 
@@ -39,6 +53,8 @@ pub struct Caches {
     /// Known-missing paths, so clients probing `_SUCCESS`/`_common_metadata` do not
     /// hammer the NameNode with lookups that just fail.
     pub negative: TtlCache<String, ()>,
+    /// Block maps keyed by absolute HDFS path.
+    pub blocks: TtlCache<String, CachedReader>,
 }
 
 impl Caches {
@@ -53,6 +69,11 @@ impl Caches {
                 capacity(config.metadata_capacity),
                 ttl(config, config.negative_ttl_ms),
                 config.metadata_capacity,
+            ),
+            blocks: TtlCache::new(
+                capacity(config.blocks_capacity),
+                ttl(config, config.blocks_ttl_ms),
+                config.blocks_capacity,
             ),
         }
     }
