@@ -1,1257 +1,960 @@
-//! Integration tests against a real HDFS cluster (MiniDFSCluster, the same Java/Maven
-//! harness `hdfs-native` uses for its own tests). These exercise OUR usage of the
-//! client — not HDFS itself.
-//!
-//! Requires a pre-started HDFS cluster (see `tests/common/mod.rs` and the CI workflow,
-//! which launches MiniDFSCluster in bash before running `cargo test`). The endpoint is
-//! read from `HDFS_NAMENODE_URI` (default `hdfs://127.0.0.1:9000`).
+//! The `impl S3 for HdfsGateway` — the thin mechanical layer connecting the `core`
+//! module to `s3s`. Each method parses the trait input, calls `core`
+//! / the HDFS client, and maps the result into an `s3s` output or error type.
 
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::Config;
+use crate::core::{decode_token, encode_token, paginate, ListEntry, ObjectMetadata, PathMapper};
+use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt;
 use hdfs_native::Client;
 use hdfs_native::ClientBuilder;
-use hdfs_s3_gateway::s3::HdfsGateway;
 use s3s::dto::*;
-use s3s::{S3Request, S3Response, S3};
+use s3s::header::X_AMZ_REQUEST_ID;
+use s3s::{s3_error, S3Error, S3Request, S3Response, S3Result, S3};
+use tracing::Instrument;
 
-mod common;
-use common::TestScope;
+/// Per-process monotonic counter used to make request ids unique within a process.
+static REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Build an `S3Request` carrying only the operation input (no HTTP context needed for
-/// direct trait calls in tests).
-fn req<T>(input: T) -> S3Request<T> {
-    S3Request {
-        input,
-        method: http::Method::GET,
-        uri: "/".parse().unwrap(),
-        headers: Default::default(),
-        extensions: Default::default(),
-        credentials: None,
-        region: None,
-        service: None,
-        trailing_headers: None,
-    }
+/// Generate a per-request id. We are not AWS, so we mint our own: a base36 timestamp
+/// plus a process-local sequence number. This is surfaced in the `x-amz-request-id`
+/// header and in logs so clients/operators can correlate requests.
+fn new_request_id() -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let seq = REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}", micros, seq)
 }
 
-/// Stand up a gateway wired to the shared cluster, isolated under a unique HDFS root.
-/// The same `Client` is returned so tests write through the exact instance the gateway uses.
-async fn setup() -> (TestScope, HdfsGateway, Client) {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let scope = TestScope::new().await;
-    let client = scope.client.clone();
-    let gateway = HdfsGateway::new(client.clone(), scope.config());
-    (scope, gateway, client)
+/// Per-request logging context (operational readiness).
+///
+/// Created at the top of each S3 operation. Records the op name and a freshly-minted
+/// `request_id` into a span so any nested log lines are correlated, and on drop emits a
+/// single structured completion event carrying the request id, op, resolved HDFS path,
+/// latency, and bytes served. Uses `tracing`'s native structured fields (not a hand-rolled
+/// correlation map). A start event is also emitted so the request id appears on more than
+/// one line, demonstrating cross-line correlation.
+///
+/// The `span` is wrapped around each upstream `hdfs-native` call via `.instrument(..)` (see
+/// the call sites). `Instrument` enters the span for the duration of each poll, so any
+/// `tracing` diagnostics emitted by `hdfs-native` while we are handling the request — e.g.
+/// `warn!("Error occurred while reading from DataNode: ...")` or `warn!("IO error on RPC
+/// call, retrying: ...")` — are recorded as children of this span and therefore
+/// automatically tagged with our `request_id`. That is how upstream HDFS issues become
+/// visible in the logs, correlated to the request that triggered them, without any per-call
+/// wiring. We deliberately do NOT hold an `EnteredSpan` guard (it is `!Send` and would break
+/// the `Send` bound on the `S3` async trait methods); `Instrument` is the Send-safe way to
+/// keep a span active across an `.await`.
+struct RequestLog {
+    op: &'static str,
+    request_id: String,
+    hdfs_path: Option<String>,
+    bytes_served: u64,
+    ok: bool,
+    start: std::time::Instant,
+    span: tracing::Span,
 }
 
-#[tokio::test]
-async fn hello_world_minidfs() {
-    // Prove we can talk to a real cluster and read a file back.
-    let scope = TestScope::new().await;
-    let client = scope.client.clone();
-
-    scope.write_file("data/hello.txt", b"hello hdfs").await;
-
-    let hello_path = format!("{}/data/hello.txt", scope.root);
-    let status = client.get_file_info(&hello_path).await.unwrap();
-    assert!(!status.isdir);
-    assert_eq!(status.length, 10);
-
-    let mut reader = client.read(&hello_path).await.unwrap();
-    let buf = reader.read_bytes(1024).await.unwrap();
-    assert_eq!(&buf[..], b"hello hdfs");
-}
-
-#[tokio::test]
-async fn head_object_and_bucket() {
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/a/b.txt", b"contents").await;
-
-    // head_bucket for the configured bucket → 200
-    let resp = gateway
-        .head_bucket(req(HeadBucketInput {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await;
-    assert!(
-        resp.is_ok(),
-        "head_bucket should succeed for configured bucket"
-    );
-
-    // head_bucket for a different bucket → NoSuchBucket
-    let err = gateway
-        .head_bucket(req(HeadBucketInput {
-            bucket: "other".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NoSuchBucket"));
-
-    // head_object on existing file → 200 with correct length
-    let resp = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/a/b.txt".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out: S3Response<HeadObjectOutput> = resp;
-    assert_eq!(out.output.content_length, Some(8));
-    assert!(out.output.e_tag.is_some());
-
-    // head_object on a directory → NoSuchKey
-    _scope.write_file("data/dir/file.txt", b"x").await;
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/dir".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NoSuchKey"));
-
-    // head_object on missing path → NoSuchKey
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/missing.txt".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NoSuchKey"));
-}
-
-#[tokio::test]
-async fn path_traversal_blocked() {
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/secret.txt", b"topsecret").await;
-
-    // A traversal key must not resolve to /secret.txt
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "../../secret.txt".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NoSuchKey"));
-}
-
-#[tokio::test]
-async fn list_objects_v2() {
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/a/b/c.txt", b"1").await;
-    _scope.write_file("data/a/b/d.txt", b"2").await;
-    _scope.write_file("data/a/e.txt", b"3").await;
-    _scope.write_file("data/f.txt", b"4").await;
-
-    // No prefix/delimiter → all objects recursively
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    let keys: Vec<String> = out
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(
-        keys,
-        vec![
-            "data/a/b/c.txt".to_string(),
-            "data/a/b/d.txt".to_string(),
-            "data/a/e.txt".to_string(),
-            "data/f.txt".to_string(),
-        ]
-    );
-
-    // delimiter=/ → subdirectories collapse to CommonPrefixes
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            delimiter: Some("/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    let prefixes: Vec<String> = out
-        .common_prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.prefix.unwrap())
-        .collect();
-    assert_eq!(prefixes, vec!["data/".to_string()]);
-}
-
-#[tokio::test]
-async fn list_objects_v2_prefix_pagination_and_order() {
-    // Prefix filtering, max-keys pagination with continuation-token
-    // round-trip, deeply-nested single CommonPrefix collapse, and strict binary-lexicographic
-    // ordering — all driven through the real `s3s` trait (HTTP-shaped, no HTTP server needed).
-    let (_scope, gateway, _client) = setup().await;
-
-    // A small tree under /data/list/.
-    _scope.write_file("data/list/a.txt", b"a").await;
-    _scope.write_file("data/list/b.txt", b"b").await;
-    _scope.write_file("data/list/sub/c.txt", b"c").await;
-    _scope.write_file("data/list/sub/d.txt", b"d").await;
-    _scope.write_file("data/list/sub/deep/e.txt", b"e").await;
-    _scope.write_file("data/list2/x.txt", b"x").await;
-
-    // --- prefix filtering -------------------------------------------------------
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/list/sub/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let keys: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(
-        keys,
-        vec![
-            "data/list/sub/c.txt".to_string(),
-            "data/list/sub/d.txt".to_string(),
-            "data/list/sub/deep/e.txt".to_string(),
-        ]
-    );
-
-    // --- deeply nested collapses to ONE CommonPrefix at the requested level --------
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/list/".into()),
-            delimiter: Some("/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let contents: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    let prefixes: Vec<String> = resp
-        .common_prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.prefix.unwrap())
-        .collect();
-    // "data/list/a.txt", "data/list/b.txt" are direct Contents; "data/list/sub/" collapses
-    // to a single CommonPrefix (NOT one per nesting level).
-    assert_eq!(
-        contents,
-        vec!["data/list/a.txt".to_string(), "data/list/b.txt".to_string()]
-    );
-    assert_eq!(prefixes, vec!["data/list/sub/".to_string()]);
-
-    // --- max-keys pagination with continuation-token round-trip ------------------
-    // List the whole bucket with max-keys=2 and walk pages.
-    let mut all: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    let expected = vec![
-        "data/list/a.txt".to_string(),
-        "data/list/b.txt".to_string(),
-        "data/list/sub/c.txt".to_string(),
-        "data/list/sub/d.txt".to_string(),
-        "data/list/sub/deep/e.txt".to_string(),
-        "data/list2/x.txt".to_string(),
-    ];
-    loop {
-        let resp = gateway
-            .list_objects_v2(req(ListObjectsV2Input {
-                bucket: "hdfs".into(),
-                max_keys: Some(2),
-                continuation_token: token.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .output;
-        let page: Vec<String> = resp
-            .contents
-            .unwrap_or_default()
-            .into_iter()
-            .map(|o| o.key.unwrap())
-            .collect();
-        all.extend(page);
-        match resp.next_continuation_token {
-            Some(t) => token = Some(t),
-            None => break,
-        }
-    }
-    assert_eq!(
-        all, expected,
-        "paginated listing must equal the full recursive listing"
-    );
-
-    // --- strict binary-lexicographic ordering ------------------------------------
-    // Keys must be sorted by raw byte order, not locale/collation. Insert a key with a
-    // byte that sorts after lowercase letters (e.g. '~') to confirm byte order.
-    _scope.write_file("data/list/~z.txt", b"z").await;
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/list/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let keys: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    let mut sorted = keys.clone();
-    sorted.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    assert_eq!(
-        keys, sorted,
-        "listing must be in strict binary-lexicographic order"
-    );
-    // '~' (0x7E) sorts after 'a'/'b'/'s' (0x61-0x73), so it must be last.
-    assert_eq!(keys.last().unwrap(), "data/list/~z.txt");
-}
-
-#[tokio::test]
-async fn list_objects_v2_prefix_with_delimiter() {
-    // The most common real-world listing shape: `prefix=<dir>/&delimiter=/`. The
-    // directory portion of the prefix is pushed down to HDFS, and the delimiter
-    // collapses the next level into CommonPrefixes.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/list/a.txt", b"a").await;
-    _scope.write_file("data/list/sub/b.txt", b"b").await;
-    _scope.write_file("data/list/sub/deep/c.txt", b"c").await;
-    _scope.write_file("data/other/d.txt", b"d").await;
-
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/list/".into()),
-            delimiter: Some("/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let contents: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    let prefixes: Vec<String> = resp
-        .common_prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.prefix.unwrap())
-        .collect();
-    assert_eq!(contents, vec!["data/list/a.txt".to_string()]);
-    assert_eq!(prefixes, vec!["data/list/sub/".to_string()]);
-}
-
-#[tokio::test]
-async fn list_objects_v2_delimiter_pagination_terminates() {
-    // Regression for the infinite-pagination loop: a delimiter listing with more
-    // CommonPrefixes than max-keys used to re-serve the same page forever (the
-    // continuation marker was applied to Contents only, never to CommonPrefixes), so
-    // a client paginator looped and every iteration re-walked the subtree. Walking
-    // every page must yield each partition exactly once and terminate.
-    let (_scope, gateway, _client) = setup().await;
-    for i in 1..=7 {
-        _scope
-            .write_file(&format!("data/tbl/part{i}/f.txt"), b"x")
-            .await;
-    }
-
-    let mut all: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    let mut pages = 0;
-    loop {
-        pages += 1;
-        assert!(
-            pages <= 8,
-            "delimiter pagination must terminate (infinite loop?)"
+impl RequestLog {
+    fn new(op: &'static str) -> Self {
+        let request_id = new_request_id();
+        let span = tracing::info_span!(
+            "s3_request",
+            op,
+            request_id = %request_id,
+            hdfs_path = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            bytes_served = tracing::field::Empty,
         );
-        let resp = gateway
-            .list_objects_v2(req(ListObjectsV2Input {
-                bucket: "hdfs".into(),
-                prefix: Some("data/tbl/".into()),
-                delimiter: Some("/".into()),
-                max_keys: Some(2),
-                continuation_token: token.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .output;
-        assert!(
-            resp.contents.unwrap_or_default().is_empty(),
-            "a pure-partition listing has no Contents"
+        // Start event: the request id appears here and again on the completion event,
+        // so a single request's log lines share a consistent id (correlation).
+        tracing::info!(parent: &span, request_id = %request_id, op = %op, "request started");
+        RequestLog {
+            op,
+            request_id,
+            hdfs_path: None,
+            bytes_served: 0,
+            ok: false,
+            start: std::time::Instant::now(),
+            span,
+        }
+    }
+
+    /// Record the resolved HDFS path for this request (once known).
+    fn set_path(&mut self, path: impl Into<String>) {
+        self.hdfs_path = Some(path.into());
+    }
+
+    /// Record the number of bytes served (for GET / object responses).
+    fn set_bytes(&mut self, n: u64) {
+        self.bytes_served = n;
+    }
+
+    /// The request id minted for this request (also attached to the HTTP response header).
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// Mark the request as having produced a successful response (vs an error).
+    fn mark_ok(&mut self) {
+        self.ok = true;
+    }
+
+    /// Attach this request's id to an `S3Error` so the HTTP error response carries
+    /// the same `x-amz-request-id` (header + XML `<RequestId>`) as success responses
+    /// and the server logs — clients/operators correlate on it. Used on every error
+    /// path so no error response is missing the correlation id.
+    fn attach(&self, err: S3Error) -> S3Error {
+        attach_error_request_id(self.request_id(), err)
+    }
+
+    /// Consume the log (emitting the completion line on drop) and return `result`
+    /// unchanged. Used by error-returning methods so the request is still logged;
+    /// the request id is attached to any error result.
+    fn finish<T>(self, result: S3Result<T>) -> S3Result<T> {
+        result.map_err(|e| self.attach(e))
+    }
+}
+
+impl Drop for RequestLog {
+    fn drop(&mut self) {
+        let latency_ms = self.start.elapsed().as_millis() as u64;
+        let path = self.hdfs_path.clone().unwrap_or_default();
+        // Single completion log line with all structured fields.
+        tracing::info!(
+            parent: &self.span,
+            request_id = %self.request_id,
+            op = %self.op,
+            hdfs_path = %path,
+            latency_ms = latency_ms,
+            bytes_served = self.bytes_served,
+            ok = self.ok,
+            "request completed"
         );
-        let page: Vec<String> = resp
-            .common_prefixes
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.prefix.unwrap())
-            .collect();
-        for p in &page {
-            assert!(!all.contains(p), "duplicate common prefix {p}");
-        }
-        all.extend(page);
-        match resp.next_continuation_token {
-            Some(t) => token = Some(t),
-            None => break,
+    }
+}
+
+/// Attach the request id (minted in `RequestLog`) to an `S3Response` as `x-amz-request-id`.
+///
+/// s3s serializes this via `resp.headers.extend(s3_resp.headers)`, which *appends* our
+/// header without clobbering any headers s3s already set — so this is safe to call on
+/// every response. This is the supported public extension point (the `S3Response.headers`
+/// field), not a hand-rolled HTTP layer.
+fn with_request_id<T>(mut resp: S3Response<T>, log: &mut RequestLog) -> S3Response<T> {
+    if let Ok(val) = http::HeaderValue::from_str(log.request_id()) {
+        resp.headers.insert(X_AMZ_REQUEST_ID, val);
+    }
+    log.mark_ok();
+    resp
+}
+
+/// Attach a request id to an `S3Error`: both the XML `<RequestId>` element and the
+/// `x-amz-request-id` HTTP header, so error responses correlate with the server logs
+/// exactly like success responses.
+///
+/// Note: s3s's `serialize_error` applies `S3Error::headers` by *replacing* the response
+/// header map, so we must re-include the XML `Content-Type` header that it sets before
+/// the replacement — otherwise the error body would lose its content type.
+fn attach_error_request_id(request_id: &str, mut err: S3Error) -> S3Error {
+    err.set_request_id(request_id.to_string());
+    let mut headers = http::HeaderMap::new();
+    if let Ok(val) = http::HeaderValue::from_str(request_id) {
+        headers.insert(X_AMZ_REQUEST_ID, val);
+    }
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/xml"),
+    );
+    err.set_headers(headers);
+    err
+}
+
+mod auth;
+pub use auth::SharedSecretAuth;
+mod error;
+pub use error::map_hdfs_error;
+pub mod backpressure;
+pub mod server;
+mod sorted_listing;
+use self::sorted_listing::{DirLister, HdfsDirLister, SortedListing};
+mod write_policy;
+
+/// Error produced while streaming a GET response body.
+#[derive(Debug, thiserror::Error)]
+enum GetBodyError {
+    /// The upstream HDFS reader failed mid-stream.
+    #[error("HDFS read failed: {0}")]
+    Upstream(#[from] std::io::Error),
+    /// The upstream stream ended before the declared content length was reached
+    /// (e.g. the file shrank between stat and read, or a DataNode failure that
+    /// surfaced as EOF). An explicit error beats a silently-short "successful"
+    /// response.
+    #[error("HDFS stream ended after {got} of {expected} declared bytes")]
+    ShortRead { expected: usize, got: usize },
+}
+
+/// Enforce an exact content length on a byte stream.
+///
+/// The HDFS reader streams from `set_position` to EOF in large chunks (the 64 KiB
+/// `ReaderStream` buffer), so a ranged GET's final chunk routinely extends past the
+/// requested window — the excess is truncated here. That is the normal contract, NOT
+/// a bug: the window's end is rarely chunk-aligned. What this wrapper detects is the
+/// opposite failure: the stream ending BEFORE `content_length` bytes were delivered
+/// (a mid-stream DataNode failure surfacing as EOF, or the file shrinking between
+/// `get_file_info` and `read`), which fails the stream explicitly rather than
+/// producing a silently-truncated "successful" response.
+fn bytes_stream(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+    content_length: usize,
+) -> impl Stream<Item = Result<Bytes, GetBodyError>> + Send + 'static {
+    futures::stream::unfold(
+        (stream, content_length, content_length),
+        |(mut stream, limit, mut remaining)| async move {
+            if remaining == 0 {
+                return None;
+            }
+            match stream.next().await {
+                Some(Ok(mut bytes)) => {
+                    if bytes.len() > remaining {
+                        bytes.truncate(remaining);
+                    }
+                    remaining -= bytes.len();
+                    Some((Ok(bytes), (stream, limit, remaining)))
+                }
+                Some(Err(e)) => Some((Err(GetBodyError::Upstream(e)), (stream, limit, remaining))),
+                None => {
+                    if remaining > 0 {
+                        let got = limit - remaining;
+                        Some((
+                            Err(GetBodyError::ShortRead {
+                                expected: limit,
+                                got,
+                            }),
+                            (stream, limit, 0),
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The gateway: holds a shared HDFS client and the path mapper.
+#[derive(Clone)]
+pub struct HdfsGateway {
+    client: Arc<Client>,
+    mapper: PathMapper,
+    config: Arc<Config>,
+}
+
+impl HdfsGateway {
+    pub fn new(client: Client, config: Config) -> Self {
+        let mapper = PathMapper::new(&config);
+        HdfsGateway {
+            client: Arc::new(client),
+            mapper,
+            config: Arc::new(config),
         }
     }
-    let expected: Vec<String> = (1..=7).map(|i| format!("data/tbl/part{i}/")).collect();
-    assert_eq!(all, expected);
-}
 
-#[tokio::test]
-async fn list_objects_v2_delimiter_shows_empty_directory() {
-    // A delimiter listing lists exactly one HDFS directory (one getListing RPC).
-    // Emptiness is not probed (that would cost an RPC per directory), so an EMPTY
-    // directory surfaces as a CommonPrefix — the namespace is surfaced as-is.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/tbl/filled/f.txt", b"x").await;
-    _scope
-        .client
-        .mkdirs(&format!("{}/data/tbl/empty", _scope.root), 0o755, true)
-        .await
-        .unwrap();
+    /// Build a `HdfsGateway` from a validated `Config`, constructing the shared HDFS
+    /// client exactly as the binary does. Shared by `main.rs` and the Python bindings so
+    /// the client-construction logic lives in one place.
+    pub fn from_config(config: &Config) -> Result<Self, String> {
+        let mut builder = ClientBuilder::new().with_url(&config.namenode_uri);
 
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/tbl/".into()),
-            delimiter: Some("/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let prefixes: Vec<String> = resp
-        .common_prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| p.prefix.unwrap())
-        .collect();
-    assert_eq!(
-        prefixes,
-        vec![
-            "data/tbl/empty/".to_string(),
-            "data/tbl/filled/".to_string(),
-        ]
-    );
-    assert!(resp.contents.unwrap_or_default().is_empty());
-}
+        if !config.hdfs_options.is_empty() {
+            builder = builder.with_config(config.hdfs_options.clone());
+        }
+        if let Some(dir) = &config.hdfs_config_dir {
+            builder = builder.with_config_dir(dir.clone());
+        }
+        if let Some(user) = &config.hdfs_user {
+            builder = builder.with_user(user.clone());
+        }
 
-#[tokio::test]
-async fn list_objects_v2_missing_prefix_directory_is_empty() {
-    // S3 semantics: listing a non-existent prefix returns an empty page, not an
-    // error — clients probe `prefix=<table>/<partition>=x/` constantly (e.g. before
-    // a partition exists). The prefix push-down must map the HDFS `FileNotFound` of
-    // the start directory to an empty listing.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/a.txt", b"a").await;
-
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/nonexistent/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(resp.contents.unwrap_or_default().is_empty());
-    assert!(resp.common_prefixes.unwrap_or_default().is_empty());
-    assert_eq!(resp.is_truncated, Some(false));
-    assert_eq!(resp.key_count, Some(0));
-    assert!(resp.next_continuation_token.is_none());
-}
-
-#[tokio::test]
-async fn list_objects_v2_prefix_pointing_at_file_is_empty() {
-    // A prefix whose directory portion is actually a file matches nothing (S3
-    // semantics) — the push-down must not turn this into an error. The NameNode
-    // `getListing` RPC reports a file path the same way as a missing one.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/a.txt", b"a").await;
-
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/a.txt/".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(resp.contents.unwrap_or_default().is_empty());
-    assert_eq!(resp.key_count, Some(0));
-}
-
-#[tokio::test]
-async fn list_objects_v2_unreadable_subdirectory_is_skipped() {
-    // Best-effort listing semantics: a directory the gateway's HDFS user cannot
-    // read must NOT fail the whole ListObjectsV2. The flat walk pops it, cannot
-    // list it (AccessControlException), skips it (logged server-side), and still
-    // serves every readable key. Only the prefix's OWN directory being unreadable
-    // answers 403 AccessDenied (matching S3) — an empty page would hide the
-    // permission problem.
-    let scope = TestScope::new().await;
-    scope.write_file("data/a.txt", b"a").await;
-
-    // An unreadable directory at the root (mode 000, owned by the superuser), so
-    // `nobody` can see its name in the parent listing but cannot enter it.
-    let forbidden = format!("{}/forbidden", scope.root);
-    let super_client = ClientBuilder::new()
-        .with_url(&scope.config().namenode_uri)
-        .build()
-        .unwrap();
-    super_client.mkdirs(&forbidden, 0o000, true).await.unwrap();
-    super_client
-        .set_owner(&forbidden, Some("root"), Some("supergroup"))
-        .await
-        .unwrap();
-
-    let gateway = scope.gateway_as("nobody");
-    let list = |prefix: Option<&str>| {
-        gateway.list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: prefix.map(String::from),
-            ..Default::default()
-        }))
-    };
-
-    // A full-root listing walks past `forbidden`: it must succeed and return
-    // everything that IS readable, skipping the unreadable subtree.
-    let resp = list(None).await.unwrap().output;
-    let keys: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(
-        keys,
-        vec!["data/a.txt".to_string()],
-        "unreadable subtrees must be skipped, not fatal"
-    );
-
-    // A prefix whose OWN directory is unreadable still answers 403 AccessDenied:
-    // there is nothing to serve, and S3 semantics say deny rather than lie with
-    // an empty page.
-    let err = list(Some("forbidden/")).await.unwrap_err();
-    assert!(
-        format!("{err:?}").contains("AccessDenied"),
-        "prefix rooted in an unreadable directory must be denied: {err:?}"
-    );
-
-    // A prefix-bounded listing of the readable subtree returns it normally.
-    let resp = list(Some("data/")).await.unwrap().output;
-    let keys: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(keys, vec!["data/a.txt".to_string()]);
-}
-
-#[tokio::test]
-async fn list_objects_v2_large_dir() {
-    // A directory with many thousands of entries must list completely
-    // and return every key exactly once. This also surfaces whether `hdfs-native`'s listing
-    // returns everything in one shot (it does per docs) rather than paginating internally.
-    let (_scope, gateway, _client) = setup().await;
-    let n: usize = 3000;
-    for i in 0..n {
-        _scope
-            .write_file(&format!("data/bigdir/file_{i:05}.bin"), b"x")
-            .await;
+        let client = builder
+            .build()
+            .map_err(|e| format!("failed to build HDFS client: {e}"))?;
+        Ok(HdfsGateway::new(client, config.clone()))
     }
 
-    let start = std::time::Instant::now();
-    // Walk all pages (default max-keys is 1000, so we must paginate to collect everything).
-    let mut keys: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let resp = gateway
-            .list_objects_v2(req(ListObjectsV2Input {
-                bucket: "hdfs".into(),
-                prefix: Some("data/bigdir/".into()),
-                continuation_token: token.clone(),
-                ..Default::default()
-            }))
+    /// The address the gateway will bind to (from config). Exposed so callers (e.g. the
+    /// Python bindings) can report the bound address after `serve`.
+    pub fn listen_addr(&self) -> &str {
+        &self.config.listen_addr
+    }
+}
+
+#[async_trait::async_trait]
+impl S3 for HdfsGateway {
+    #[tracing::instrument(skip(self))]
+    async fn head_bucket(
+        &self,
+        req: S3Request<HeadBucketInput>,
+    ) -> S3Result<S3Response<HeadBucketOutput>> {
+        let mut log = RequestLog::new("HeadBucket");
+        let bucket = req.input.bucket.as_str();
+        if bucket != self.mapper.bucket() {
+            return Err(log.attach(s3_error!(NoSuchBucket)));
+        }
+        Ok(with_request_id(
+            S3Response::new(HeadBucketOutput::default()),
+            &mut log,
+        ))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let mut log = RequestLog::new("HeadObject");
+        let input = req.input;
+        if input.bucket.as_str() != self.mapper.bucket() {
+            return Err(log.attach(s3_error!(NoSuchBucket)));
+        }
+
+        let key = input.key.as_str();
+        let hdfs_path = self
+            .mapper
+            .key_to_hdfs_path(key)
+            .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
+        log.set_path(&hdfs_path);
+
+        let status = self
+            .client
+            .get_file_info(&hdfs_path)
+            .instrument(log.span.clone())
             .await
-            .unwrap()
-            .output;
-        keys.extend(
-            resp.contents
-                .unwrap_or_default()
-                .into_iter()
-                .map(|o| o.key.unwrap()),
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+
+        // Directories are never surfaced as objects.
+        if status.isdir {
+            return Err(log.attach(s3_error!(NoSuchKey)));
+        }
+
+        let meta = ObjectMetadata::from_hdfs(
+            status.path,
+            status.length as u64,
+            status.isdir,
+            status.modification_time,
+            None, // hdfs-native does not expose getFileChecksum (not supported upstream)
         );
-        match resp.next_continuation_token {
-            Some(t) => token = Some(t),
-            None => break,
+        let etag = ETag::Strong(meta.etag());
+        let last_modified = millis_to_timestamp(status.modification_time);
+
+        // --- Conditional headers (RFC 7232) — identical semantics to GetObject. ---
+        // HEAD is subject to the same preconditions; clients use it for cheap
+        // freshness checks (e.g. cache revalidation) and expect 304/412 here too.
+        // If-Match / If-Unmodified-Since → 412 PreconditionFailed when not satisfied.
+        // If-None-Match / If-Modified-Since → 304 NotModified when satisfied.
+        if let Some(cond) = &input.if_match {
+            let matched = match cond {
+                ETagCondition::Any => true,
+                ETagCondition::ETag(other) => etag.strong_cmp(other),
+            };
+            if !matched {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
         }
-    }
-    let elapsed = start.elapsed();
-
-    assert_eq!(keys.len(), n, "every entry must be listed exactly once");
-    // No duplicates.
-    let mut uniq = keys.clone();
-    uniq.sort();
-    uniq.dedup();
-    assert_eq!(uniq.len(), n, "no duplicate keys in listing");
-    // Loose latency gate: 3000 entries should list well under a few seconds against MiniDFS.
-    assert!(
-        elapsed.as_secs() < 30,
-        "listing 3000 entries took too long: {elapsed:?}"
-    );
-}
-
-#[tokio::test]
-async fn list_objects_v2_wide_tree_flat_pagination() {
-    // A wide, shallow tree: many directories, each with a few files. The flat
-    // (no-delimiter) listing must merge the per-directory listings in strict byte
-    // order across directory boundaries, with continuation-token pagination tiling
-    // the full key set exactly once (the lazy k-way merge path).
-    let (_scope, gateway, _client) = setup().await;
-    let mut expected: Vec<String> = Vec::new();
-    for d in 0..25 {
-        for f in 0..3 {
-            let key = format!("data/wide/dir_{d:02}/file_{f}.bin");
-            _scope.write_file(&key, b"x").await;
-            expected.push(key);
+        if let Some(since) = &input.if_unmodified_since {
+            if last_modified > *since {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
         }
-    }
-    expected.sort();
-
-    let mut collected: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let resp = gateway
-            .list_objects_v2(req(ListObjectsV2Input {
-                bucket: "hdfs".into(),
-                prefix: Some("data/wide/".into()),
-                max_keys: Some(17),
-                continuation_token: token.clone(),
-                ..Default::default()
-            }))
-            .await
-            .unwrap()
-            .output;
-        collected.extend(
-            resp.contents
-                .unwrap_or_default()
-                .into_iter()
-                .map(|o| o.key.unwrap()),
-        );
-        match resp.next_continuation_token {
-            Some(t) => token = Some(t),
-            None => break,
+        if let Some(cond) = &input.if_none_match {
+            let not_modified = match cond {
+                ETagCondition::Any => true, // resource exists → not modified
+                ETagCondition::ETag(other) => etag.weak_cmp(other),
+            };
+            if not_modified {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
         }
+        if let Some(since) = &input.if_modified_since {
+            if last_modified <= *since {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
+        }
+
+        let output = HeadObjectOutput {
+            // RFC 9110: advertise that byte ranges are supported, so clients that
+            // probe (e.g. pyarrow/DuckDB) decide to issue ranged GETs.
+            accept_ranges: Some("bytes".to_string()),
+            content_length: Some(status.length as i64),
+            content_type: Some(meta.content_type()),
+            last_modified: Some(last_modified),
+            e_tag: Some(etag),
+            ..Default::default()
+        };
+        Ok(with_request_id(S3Response::new(output), &mut log))
     }
-    assert_eq!(
-        collected, expected,
-        "flat listing must tile the wide tree exactly once, in byte order"
-    );
-}
 
-#[tokio::test]
-async fn list_objects_v2_flat_listing_uses_utf8_byte_order() {
-    // S3 keys sort by UTF-8 bytes; HDFS lists children in Java String order,
-    // which differs for astral-plane characters (U+10000 sorts before U+E000 in
-    // Java UTF-16 code-unit order, but after it in UTF-8 byte order). The flat
-    // (no-delimiter) listing must emit S3's byte order regardless of the order
-    // the NameNode returns.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/ord/\u{10000}.bin", b"a").await;
-    _scope.write_file("data/ord/\u{e000}.bin", b"b").await;
-
-    let resp = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            prefix: Some("data/ord/".into()),
+    #[tracing::instrument(skip(self))]
+    async fn list_buckets(
+        &self,
+        _req: S3Request<ListBucketsInput>,
+    ) -> S3Result<S3Response<ListBucketsOutput>> {
+        let mut log = RequestLog::new("ListBuckets");
+        let bucket = Bucket {
+            name: Some(self.mapper.bucket().to_string()),
+            creation_date: Some(Timestamp::from(SystemTime::now())),
+            bucket_region: None,
+        };
+        let output = ListBucketsOutput {
+            buckets: Some(vec![bucket]),
+            owner: None,
             ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let keys: Vec<String> = resp
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(
-        keys,
-        vec!["data/ord/\u{e000}.bin", "data/ord/\u{10000}.bin"],
-        "flat listing must use UTF-8 byte order, not Java String order"
-    );
-}
-
-#[tokio::test]
-async fn get_object_full_and_ranged() {
-    let (_scope, gateway, _client) = setup().await;
-
-    // A 1 MiB file of a repeating pattern.
-    let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    _scope.write_file("data/big.bin", &data).await;
-
-    // Full GET → body bytes match exactly, correct Content-Length.
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/big.bin".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    assert_eq!(out.content_length, Some((1024 * 1024) as i64));
-    let body = out.body.unwrap();
-    let bytes = collect_body(body).await;
-    assert_eq!(&bytes[..], &data[..]);
-
-    // Range bytes=0-99 → first 100 bytes.
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/big.bin".into(),
-            range: Some(Range::Int {
-                first: 0,
-                last: Some(99),
-            }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    assert_eq!(out.content_length, Some(100));
-    assert_eq!(out.content_range.as_deref(), Some("bytes 0-99/1048576"));
-    let bytes = collect_body(out.body.unwrap()).await;
-    assert_eq!(&bytes[..], &data[0..100]);
-
-    // Range bytes=100- → from offset 100 to end.
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/big.bin".into(),
-            range: Some(Range::Int {
-                first: 100,
-                last: None,
-            }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    assert_eq!(out.content_length, Some((1024 * 1024 - 100) as i64));
-    let bytes = collect_body(out.body.unwrap()).await;
-    assert_eq!(&bytes[..], &data[100..]);
-
-    // Range bytes=-500 → last 500 bytes.
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/big.bin".into(),
-            range: Some(Range::Suffix { length: 500 }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let out = resp.output;
-    assert_eq!(out.content_length, Some(500));
-    let bytes = collect_body(out.body.unwrap()).await;
-    assert_eq!(&bytes[..], &data[1024 * 1024 - 500..]);
-
-    // Unsatisfiable range → InvalidRange (416).
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/big.bin".into(),
-            range: Some(Range::Int {
-                first: 1024 * 1024,
-                last: None,
-            }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("InvalidRange"));
-
-    // get_object on a directory → NoSuchKey.
-    _scope.write_file("data/dir/file.txt", b"x").await;
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/dir".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NoSuchKey"));
-}
-
-#[tokio::test]
-async fn get_object_conditionals() {
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/c.txt", b"conditional").await;
-
-    // Capture the ETag from head_object.
-    let head = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let etag = head.output.e_tag.clone().unwrap();
-
-    // If-None-Match: <etag> → 304 NotModified.
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_none_match: Some(ETagCondition::ETag(etag.clone())),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NotModified"));
-
-    // If-Match: <etag> → 200 (matches).
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_match: Some(ETagCondition::ETag(etag.clone())),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    let bytes = collect_body(resp.output.body.unwrap()).await;
-    assert_eq!(&bytes[..], b"conditional");
-
-    // If-Match: wrong etag → 412 PreconditionFailed.
-    let wrong = ETag::Strong("deadbeef".to_string());
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_match: Some(ETagCondition::ETag(wrong)),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("PreconditionFailed"));
-}
-
-#[tokio::test]
-async fn head_object_accept_ranges_and_conditionals() {
-    // HEAD must advertise byte-range support and honor the same RFC 7232
-    // conditional headers as GET (clients use HEAD for cheap freshness checks).
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/c.txt", b"conditional").await;
-
-    // Plain HEAD → 200 with Accept-Ranges: bytes.
-    let resp = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.output.accept_ranges,
-        Some("bytes".to_string()),
-        "HEAD must advertise byte-range support"
-    );
-    let etag = resp.output.e_tag.clone().unwrap();
-
-    // If-None-Match: <etag> → 304 NotModified (RFC 7232 applies to HEAD too).
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_none_match: Some(ETagCondition::ETag(etag.clone())),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NotModified"));
-
-    // If-Match: wrong etag → 412 PreconditionFailed.
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_match: Some(ETagCondition::ETag(ETag::Strong("deadbeef".to_string()))),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("PreconditionFailed"));
-
-    // If-Modified-Since: a timestamp in the future → 304 (not modified since).
-    let future = Timestamp::from(SystemTime::now() + Duration::from_secs(3600));
-    let err = gateway
-        .head_object(req(HeadObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/c.txt".into(),
-            if_modified_since: Some(future),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("NotModified"));
-}
-
-#[tokio::test]
-async fn get_object_empty_file_ranges() {
-    // Range semantics on a zero-length object (regression test for the
-    // Content-Range u64 underflow: `resolve_range(0, Suffix)` used to return a
-    // zero-length window and the header arithmetic wrapped around).
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/empty.bin", b"").await;
-
-    // Suffix range on an empty file: unsatisfiable → 416 InvalidRange (AWS S3
-    // behavior).
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/empty.bin".into(),
-            range: Some(Range::Suffix { length: 10 }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("InvalidRange"));
-
-    // A zero-length suffix is also unsatisfiable.
-    let err = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/empty.bin".into(),
-            range: Some(Range::Suffix { length: 0 }),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("InvalidRange"));
-
-    // A full (unranged) GET of an empty file still works: 200 with zero bytes.
-    let resp = gateway
-        .get_object(req(GetObjectInput {
-            bucket: "hdfs".into(),
-            key: "data/empty.bin".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-    assert_eq!(resp.output.content_length, Some(0));
-    assert!(collect_body(resp.output.body.unwrap()).await.is_empty());
-}
-
-#[tokio::test]
-async fn list_objects_v2_invalid_token_rejected() {
-    // A malformed continuation token must be a client error (`InvalidToken`),
-    // not a silent restart at page 1 — otherwise a client with a corrupted or
-    // truncated token polls the first page forever.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/a.txt", b"a").await;
-    _scope.write_file("data/b.txt", b"b").await;
-
-    let err = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            continuation_token: Some("not base64 !!!".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap_err();
-    assert!(
-        format!("{err:?}").contains("InvalidToken"),
-        "invalid token must be rejected with InvalidToken, got: {err:?}"
-    );
-
-    // Sanity: a well-formed token from a real truncated listing still decodes
-    // (URL-safe base64, no padding) and resumes at the right key.
-    let first = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            max_keys: Some(1),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let token = first
-        .next_continuation_token
-        .expect("page must be truncated");
-    let second = gateway
-        .list_objects_v2(req(ListObjectsV2Input {
-            bucket: "hdfs".into(),
-            continuation_token: Some(token),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    let keys: Vec<String> = second
-        .contents
-        .unwrap_or_default()
-        .into_iter()
-        .map(|o| o.key.unwrap())
-        .collect();
-    assert_eq!(keys, vec!["data/b.txt".to_string()]);
-}
-
-/// Collect a streaming body into a single `Vec<u8>`.
-async fn collect_body(body: s3s::dto::StreamingBlob) -> Vec<u8> {
-    use futures::StreamExt;
-    let mut out = Vec::new();
-    let mut stream = body;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("body chunk should not error in tests");
-        out.extend_from_slice(&chunk);
+        };
+        Ok(with_request_id(S3Response::new(output), &mut log))
     }
-    out
-}
 
-/// Assert that an `S3Result` is an `AccessDenied` error (write-op policy).
-fn assert_access_denied<T: std::fmt::Debug>(res: s3s::S3Result<T>) {
-    let err = res.unwrap_err();
-    let dbg = format!("{err:?}");
-    assert!(
-        dbg.contains("AccessDenied"),
-        "expected AccessDenied, got: {dbg}"
-    );
-}
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let mut log = RequestLog::new("ListObjectsV2");
+        let input = req.input;
+        if input.bucket.as_str() != self.mapper.bucket() {
+            return Err(log.attach(s3_error!(NoSuchBucket)));
+        }
 
-#[tokio::test]
-async fn write_ops_uniformly_denied() {
-    // Every write-shaped operation returns a uniform AccessDenied, regardless of
-    // whether the target exists. We seed a file so existence is not the deciding factor.
-    let (_scope, gateway, _client) = setup().await;
-    _scope.write_file("data/w.txt", b"x").await;
+        let prefix = input.prefix.as_deref().unwrap_or("").to_string();
+        // S3 semantics: an empty delimiter means "no grouping" — treat it as None so
+        // keys are returned as Contents rather than collapsing every key into the
+        // prefix itself (which `rest.find("")` would otherwise do at index 0).
+        let delimiter = input.delimiter.as_deref().filter(|d| !d.is_empty());
+        let max_keys = input.max_keys.unwrap_or(1000) as usize;
 
-    // Object-level writes.
-    assert_access_denied(
-        gateway
-            .put_object(req(PutObjectInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .delete_object(req(DeleteObjectInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .delete_objects(req(DeleteObjectsInput {
-                bucket: "hdfs".into(),
-                bypass_governance_retention: None,
-                checksum_algorithm: None,
-                delete: Delete {
-                    objects: ObjectIdentifierList::default(),
-                    quiet: None,
+        // Pagination: resume after the decoded continuation token. A token that does
+        // not decode is a client error (`InvalidToken`, matching AWS S3) — silently
+        // falling back to the first page would make a client with a corrupted or
+        // truncated token poll page 1 forever. Decoded up front so both listing
+        // strategies below can skip already-served keys without materializing them.
+        let start_after = match input.continuation_token.as_deref() {
+            Some(token) => {
+                Some(decode_token(token).ok_or_else(|| log.attach(s3_error!(InvalidToken)))?)
+            }
+            None => input.start_after.clone(),
+        };
+
+        // Contents and CommonPrefixes of the requested page, in key order, plus the raw
+        // last key of the page (the next continuation token) when it is truncated.
+        let (page_entries, page_prefixes, is_truncated, next_token) = if delimiter.is_some() {
+            // --- Delimiter path: ONE non-recursive listing of the prefix directory. ---
+            // With a delimiter, a listing's output is fully determined by the direct
+            // children of the directory part of the prefix: matching files become
+            // Contents, matching subdirectories collapse into CommonPrefixes. A
+            // recursive walk (one `getListing` RPC per directory of the subtree) would
+            // be pure waste, so list exactly the one directory (`recursive = false`).
+            //
+            // Permission semantics: subdirectories are never entered, and the parent
+            // listing carries a child's name without needing access to the child — so
+            // an unpermissioned subdirectory still surfaces as a CommonPrefix and is
+            // simply never opened. Only the prefix's own directory being unreadable
+            // fails the request (403 AccessDenied, matching S3).
+            //
+            // Semantic note: an EMPTY HDFS directory is a real directory, so it now
+            // appears as a CommonPrefix. A recursive walk used to hide empty
+            // directories (only files became entries), but detecting emptiness would
+            // cost one extra RPC per directory — the very amplification this
+            // single-listing path exists to avoid. The namespace is surfaced as-is.
+            let statuses = match self.mapper.list_start(&prefix) {
+                // The prefix cannot match any key under the root (e.g. it escapes it):
+                // S3 semantics — an empty listing, not an error.
+                None => Vec::new(),
+                Some(hdfs_start) => match self
+                    .client
+                    .list_status(&hdfs_start, false)
+                    .instrument(log.span.clone())
+                    .await
+                {
+                    Ok(statuses) => statuses,
+                    // The prefix's directory does not exist (or the prefix points at a
+                    // file, which the NameNode `getListing` reports the same way):
+                    // nothing can match — an empty listing, not an error. Clients probe
+                    // non-existent prefixes (e.g. `table/partition=x/` before it exists)
+                    // constantly, and real S3 answers those with an empty page.
+                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
+                    Err(e) => {
+                        return Err(
+                            log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                        )
+                    }
                 },
-                expected_bucket_owner: None,
-                mfa: None,
-                request_payer: None,
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .copy_object(req(CopyObjectInput::builder()
-                .bucket("hdfs".to_string())
-                .key("data/w2.txt".to_string())
-                .copy_source(CopySource::Bucket {
-                    bucket: "hdfs".into(),
-                    key: "data/w.txt".into(),
-                    version_id: None,
-                })
-                .build()
-                .unwrap()))
-            .await,
-    );
+            };
 
-    // Bucket-level writes.
-    assert_access_denied(
-        gateway
-            .create_bucket(req(CreateBucketInput {
-                bucket: "hdfs".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .delete_bucket(req(DeleteBucketInput {
-                bucket: "hdfs".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
+            let mut files: Vec<ListEntry> = Vec::new();
+            let mut dirs: Vec<String> = Vec::new();
+            for s in statuses {
+                let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
+                    continue;
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                if s.isdir {
+                    dirs.push(key);
+                } else {
+                    files.push(ListEntry {
+                        key,
+                        size: s.length as u64,
+                        modification_time: s.modification_time,
+                    });
+                }
+            }
 
-    // Multipart upload lifecycle.
-    assert_access_denied(
-        gateway
-            .create_multipart_upload(req(CreateMultipartUploadInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .upload_part(req(UploadPartInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .complete_multipart_upload(req(CompleteMultipartUploadInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .abort_multipart_upload(req(AbortMultipartUploadInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .list_multipart_uploads(req(ListMultipartUploadsInput {
-                bucket: "hdfs".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
-    assert_access_denied(
-        gateway
-            .list_parts(req(ListPartsInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
-                ..Default::default()
-            }))
-            .await,
-    );
+            let page = paginate(
+                &files,
+                &dirs,
+                &prefix,
+                delimiter,
+                start_after.as_deref(),
+                max_keys,
+            );
+            (
+                page.contents,
+                page.common_prefixes,
+                page.is_truncated,
+                page.next_token,
+            )
+        } else {
+            // --- No-delimiter path (flat listing): lazy sorted k-way merge ---
+            // The flat listing used to walk the whole bounded subtree per
+            // request (one `getListing` RPC per directory) and materialize it
+            // before paging — re-paying the full walk on every continuation
+            // page. Instead, per-directory listings are merged lazily in key
+            // order (see `sorted_listing`): only the directories that sort
+            // before the page boundary are opened, memory is bounded to the
+            // merge frontier, and page 1 of a huge subtree costs only what
+            // `max_keys` actually needs.
+            let (page_entries, is_truncated) = match self.mapper.list_start(&prefix) {
+                // The prefix cannot match any key under the root (e.g. it escapes
+                // it): S3 semantics — an empty listing, not an error.
+                None => (Vec::new(), false),
+                Some(hdfs_start) => {
+                    let lister: Arc<dyn DirLister> =
+                        Arc::new(HdfsDirLister::new(self.client.clone(), log.span.clone()));
+                    let mut listing = SortedListing::new(
+                        lister,
+                        hdfs_start,
+                        prefix.clone(),
+                        start_after.clone(),
+                        self.mapper.clone(),
+                    );
+                    listing.collect_page(max_keys).await.map_err(|e| {
+                        log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                    })?
+                }
+            };
+            let next_token = if is_truncated {
+                page_entries.last().map(|e| e.key.clone())
+            } else {
+                None
+            };
+            (page_entries, Vec::new(), is_truncated, next_token)
+        };
 
-    // Restore (object-level lifecycle write).
-    assert_access_denied(
-        gateway
-            .restore_object(req(RestoreObjectInput {
-                bucket: "hdfs".into(),
-                key: "data/w.txt".into(),
+        let result_contents: Vec<Object> = page_entries
+            .iter()
+            .map(|e| Object {
+                key: Some(e.key.clone()),
+                size: Some(e.size as i64),
+                last_modified: Some(millis_to_timestamp(e.modification_time)),
+                e_tag: Some(ETag::Strong(crate::core::fallback_etag(
+                    e.size,
+                    e.modification_time,
+                ))), // hdfs-native does not expose getFileChecksum (not supported upstream)
                 ..Default::default()
-            }))
-            .await,
-    );
+            })
+            .collect();
+
+        let result_prefixes: Vec<CommonPrefix> = page_prefixes
+            .iter()
+            .map(|p| CommonPrefix {
+                prefix: Some(p.clone()),
+            })
+            .collect();
+
+        let output = ListObjectsV2Output {
+            name: Some(self.mapper.bucket().to_string()),
+            prefix: input.prefix,
+            delimiter: input.delimiter,
+            max_keys: Some(max_keys as i32),
+            is_truncated: Some(is_truncated),
+            contents: if result_contents.is_empty() {
+                None
+            } else {
+                Some(result_contents)
+            },
+            common_prefixes: if result_prefixes.is_empty() {
+                None
+            } else {
+                Some(result_prefixes)
+            },
+            continuation_token: input.continuation_token,
+            next_continuation_token: next_token.as_ref().map(|k| encode_token(k)),
+            key_count: Some((page_entries.len() + page_prefixes.len()) as i32),
+            ..Default::default()
+        };
+        Ok(with_request_id(S3Response::new(output), &mut log))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let mut log = RequestLog::new("GetObject");
+        let input = req.input;
+        if input.bucket.as_str() != self.mapper.bucket() {
+            return Err(log.attach(s3_error!(NoSuchBucket)));
+        }
+
+        let key = input.key.as_str();
+        let hdfs_path = self
+            .mapper
+            .key_to_hdfs_path(key)
+            .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
+        log.set_path(&hdfs_path);
+
+        let status = self
+            .client
+            .get_file_info(&hdfs_path)
+            .instrument(log.span.clone())
+            .await
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+
+        // Directories are never surfaced as objects.
+        if status.isdir {
+            return Err(log.attach(s3_error!(NoSuchKey)));
+        }
+
+        let file_len = status.length as u64;
+        let last_modified = millis_to_timestamp(status.modification_time);
+
+        let meta = ObjectMetadata::from_hdfs(
+            status.path,
+            file_len,
+            status.isdir,
+            status.modification_time,
+            None, // hdfs-native does not expose getFileChecksum (not supported upstream)
+        );
+        let etag = ETag::Strong(meta.etag());
+        let content_type = meta.content_type();
+
+        // --- Conditional headers (RFC 7232) -------------------------------------
+        // If-Match / If-Unmodified-Since → 412 PreconditionFailed when not satisfied.
+        // If-None-Match / If-Modified-Since → 304 NotModified when satisfied.
+        if let Some(cond) = &input.if_match {
+            let matched = match cond {
+                ETagCondition::Any => true,
+                ETagCondition::ETag(other) => etag.strong_cmp(other),
+            };
+            if !matched {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
+        }
+        if let Some(since) = &input.if_unmodified_since {
+            if last_modified > *since {
+                return Err(log.attach(s3_error!(PreconditionFailed)));
+            }
+        }
+        if let Some(cond) = &input.if_none_match {
+            let not_modified = match cond {
+                ETagCondition::Any => true, // resource exists → not modified
+                ETagCondition::ETag(other) => etag.weak_cmp(other),
+            };
+            if not_modified {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
+        }
+        if let Some(since) = &input.if_modified_since {
+            if last_modified <= *since {
+                return Err(log.attach(s3_error!(NotModified)));
+            }
+        }
+
+        // --- Range resolution ---------------------------------------------------
+        let (start, end_exclusive, content_length, content_range) = match input.range {
+            None => (0u64, file_len, file_len, None),
+            Some(range) => {
+                let resolved = match range {
+                    Range::Int { first, last } => match last {
+                        Some(last) => crate::core::ByteRange::Inclusive { first, last },
+                        None => crate::core::ByteRange::From { first },
+                    },
+                    Range::Suffix { length } => crate::core::ByteRange::Suffix { length },
+                };
+                let (s, e) = crate::core::resolve_range(file_len, resolved)
+                    .ok_or_else(|| log.attach(s3_error!(InvalidRange)))?;
+                let len = e - s;
+                let cr = fmt_content_range(s, e - 1, file_len);
+                (s, e, len, Some(cr))
+            }
+        };
+
+        // hdfs-native addresses readers with `usize`, so on 32-bit targets a window
+        // beyond 4 GiB cannot be addressed — silently truncating the offset would
+        // serve the wrong bytes. Reject it explicitly (416) instead; on 64-bit
+        // targets this never triggers.
+        let Ok(window_start) = usize::try_from(start) else {
+            return Err(log.attach(s3_error!(InvalidRange)));
+        };
+        let Ok(window_end) = usize::try_from(end_exclusive) else {
+            return Err(log.attach(s3_error!(InvalidRange)));
+        };
+
+        // --- Streaming body (never buffer the whole object) -------------
+        let mut reader = self
+            .client
+            .read(&hdfs_path)
+            .instrument(log.span.clone())
+            .await
+            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+
+        // Protect against a file shrinking between the metadata lookup and the read.
+        // If the current file is shorter than the requested end, the response would be
+        // silently truncated if we streamed it; fail explicitly instead.
+        if reader.file_length() < window_end {
+            return Err(log.attach(s3_error!(InvalidRange)));
+        }
+
+        let remaining = window_end - window_start;
+        let stream = reader.read_range_stream(window_start, remaining);
+        // `bytes_stream` enforces the exact content length: the final chunk of a
+        // ranged read is truncated to the window (the HDFS reader streams in 64 KiB
+        // chunks past the range end — normal), and an upstream stream that ends
+        // early fails with a short-read error instead of a silently-short
+        // "successful" response.
+        let body = bytes_stream(stream, remaining);
+
+        let output = GetObjectOutput {
+            // RFC 9110: advertise byte-range support on GET responses too.
+            accept_ranges: Some("bytes".to_string()),
+            body: Some(StreamingBlob::wrap(body)),
+            content_length: Some(content_length as i64),
+            content_range,
+            last_modified: Some(last_modified),
+            e_tag: Some(etag),
+            content_type: Some(content_type),
+            ..Default::default()
+        };
+        log.set_bytes(content_length);
+        Ok(with_request_id(S3Response::new(output), &mut log))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Write-shaped operations → uniform AccessDenied (read-only gateway).
+    // -----------------------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self))]
+    async fn put_object(
+        &self,
+        _req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let log = RequestLog::new("PutObject");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_object(
+        &self,
+        _req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let log = RequestLog::new("DeleteObject");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_objects(
+        &self,
+        _req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let log = RequestLog::new("DeleteObjects");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn create_bucket(
+        &self,
+        _req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        let log = RequestLog::new("CreateBucket");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_bucket(
+        &self,
+        _req: S3Request<DeleteBucketInput>,
+    ) -> S3Result<S3Response<DeleteBucketOutput>> {
+        let log = RequestLog::new("DeleteBucket");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn copy_object(
+        &self,
+        _req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let log = RequestLog::new("CopyObject");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn create_multipart_upload(
+        &self,
+        _req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let log = RequestLog::new("CreateMultipartUpload");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn upload_part(
+        &self,
+        _req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let log = RequestLog::new("UploadPart");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn complete_multipart_upload(
+        &self,
+        _req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let log = RequestLog::new("CompleteMultipartUpload");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn abort_multipart_upload(
+        &self,
+        _req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let log = RequestLog::new("AbortMultipartUpload");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_multipart_uploads(
+        &self,
+        _req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let log = RequestLog::new("ListMultipartUploads");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_parts(
+        &self,
+        _req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let log = RequestLog::new("ListParts");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_object(
+        &self,
+        _req: S3Request<RestoreObjectInput>,
+    ) -> S3Result<S3Response<RestoreObjectOutput>> {
+        let log = RequestLog::new("RestoreObject");
+        log.finish(Err(write_policy::write_denied()))
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Bucket-configuration probes → "not configured" (real S3 answers these).
+    // -----------------------------------------------------------------------------------------
+
+    #[tracing::instrument(skip(self))]
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        let mut log = RequestLog::new("GetBucketVersioning");
+        let resp = write_policy::bucket_versioning_not_configured(req)?;
+        Ok(with_request_id(resp, &mut log))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        let mut log = RequestLog::new("GetBucketTagging");
+        let resp = write_policy::bucket_tagging_not_configured(req)?;
+        Ok(with_request_id(resp, &mut log))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_bucket_acl(
+        &self,
+        req: S3Request<GetBucketAclInput>,
+    ) -> S3Result<S3Response<GetBucketAclOutput>> {
+        let mut log = RequestLog::new("GetBucketAcl");
+        let resp = write_policy::bucket_acl_not_configured(req)?;
+        Ok(with_request_id(resp, &mut log))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_bucket_cors(
+        &self,
+        req: S3Request<GetBucketCorsInput>,
+    ) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        let mut log = RequestLog::new("GetBucketCORS");
+        let resp = write_policy::bucket_cors_not_configured(req)?;
+        Ok(with_request_id(resp, &mut log))
+    }
 }
 
-#[tokio::test]
-async fn bucket_config_probes_not_configured() {
-    // Bucket-config probes answer the way real S3 would on a fresh bucket.
-    let (_scope, gateway, _client) = setup().await;
-
-    // Versioning → disabled (empty status).
-    let out = gateway
-        .get_bucket_versioning(req(GetBucketVersioningInput {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(
-        out.status.is_none(),
-        "versioning should be 'not configured'"
-    );
-
-    // Tagging → empty tag set.
-    let out = gateway
-        .get_bucket_tagging(req(GetBucketTaggingInput {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(out.tag_set.is_empty(), "tagging should be empty");
-
-    // ACL → no owner/grants.
-    let out = gateway
-        .get_bucket_acl(req(GetBucketAclInput {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(
-        out.owner.is_none() && out.grants.is_none(),
-        "acl should be 'not configured'"
-    );
-
-    // CORS → no rules.
-    let out = gateway
-        .get_bucket_cors(req(GetBucketCorsInput {
-            bucket: "hdfs".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap()
-        .output;
-    assert!(out.cors_rules.is_none(), "cors should be 'not configured'");
+/// <https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Range>
+fn fmt_content_range(start: u64, end_inclusive: u64, size: u64) -> String {
+    format!("bytes {start}-{end_inclusive}/{size}")
 }
+
+/// Convert HDFS modification_time (millis since epoch) to an `s3s` `Timestamp`.
+fn millis_to_timestamp(millis: u64) -> Timestamp {
+    let secs = millis / 1000;
+    let nanos = ((millis % 1000) * 1_000_000) as u32;
+    let st = UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    Timestamp::from(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    #[test]
+    fn bytes_stream_errors_on_short_read() {
+        let stream = stream::iter(vec![Ok(Bytes::from_static(b"abc"))]);
+        let body = bytes_stream(stream, 5);
+
+        let err = futures::executor::block_on(async {
+            body.into_async_read().next().await.unwrap().unwrap_err()
+        });
+
+        assert!(matches!(
+            err,
+            GetBodyError::ShortRead {
+                expected: 5,
+                got: 3,
+            }
+        ));
+    }
+}
+
