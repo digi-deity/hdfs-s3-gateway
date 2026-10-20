@@ -332,6 +332,47 @@ impl HdfsGateway {
             Err(e) => Err(log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))),
         }
     }
+
+    /// Open (or reuse) the object's block map.
+    ///
+    /// `client.read()` fetches `getBlockLocations(path, 0, i64::MAX)` — the whole block
+    /// list, for every GET. For a multi-TB object with thousands of blocks that is the
+    /// dominant NameNode cost of a small ranged read, and parquet-style clients issue
+    /// many such reads per object. Cache the `FileReader` and reuse it only while the
+    /// file's freshly read identity (length, mtime) still matches: a replaced object can
+    /// never be served from the previous block map. A failed read evicts the entry so an
+    /// all-replicas-stale block map costs one failed request, not the rest of its TTL.
+    async fn open_reader(
+        &self,
+        hdfs_path: &str,
+        meta: &cache::FileMeta,
+        log: &RequestLog,
+    ) -> S3Result<Arc<hdfs_native::file::FileReader>> {
+        if let Some(cached) = self.cache.blocks.get(hdfs_path) {
+            if cached.length == meta.length && cached.modification_time == meta.modification_time {
+                return Ok(cached.reader);
+            }
+            self.cache.blocks.remove(hdfs_path);
+        }
+
+        let reader = Arc::new(
+            self.client
+                .read(hdfs_path)
+                .instrument(log.span.clone())
+                .await
+                .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?,
+        );
+        self.cache.blocks.insert(
+            hdfs_path.to_string(),
+            cache::CachedReader {
+                reader: Arc::clone(&reader),
+                length: meta.length,
+                modification_time: meta.modification_time,
+            },
+            1,
+        );
+        Ok(reader)
+    }
 }
 
 #[async_trait::async_trait]
@@ -790,22 +831,28 @@ impl S3 for HdfsGateway {
         };
 
         // --- Streaming body (never buffer the whole object) -------------
-        let reader = self
-            .client
-            .read(&hdfs_path)
-            .instrument(log.span.clone())
-            .await
-            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+        let reader = self.open_reader(&hdfs_path, &status, &log).await?;
         // One HDFS read for the whole window. Reading via AsyncRead (ReaderStream) starts a
         // new DataNode ReadBlock op per 64 KiB buffer (~8 ms each), capping a GET at ~8 MB/s.
         if window_end > reader.file_length() {
-            // File shrank since get_file_info; read_range_stream would panic.
+            // File shrank since the metadata was read; read_range_stream would panic.
+            // Drop the now-stale block map so the next request re-opens it.
+            self.cache.blocks.remove(&hdfs_path);
             return Err(log.attach(s3_error!(InternalError)));
         }
         let remaining = window_end - window_start;
+        let cache = Arc::clone(&self.cache);
+        let cached_path = hdfs_path.clone();
         let stream = reader
             .read_range_stream(window_start, remaining)
-            .map(|r| r.map_err(std::io::Error::other))
+            .map(move |r| {
+                if r.is_err() {
+                    // Stale block locations (or a DataNode failure): stop reusing this
+                    // block map for the rest of its TTL.
+                    cache.blocks.remove(&cached_path);
+                }
+                r.map_err(std::io::Error::other)
+            })
             .boxed();
         // `hdfs-native`'s range stream is `Send` but not `Sync` (it is built on
         // `BoxStream`, which erases `Sync`), while `s3s` requires the response body to be
