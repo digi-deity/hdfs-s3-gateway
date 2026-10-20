@@ -1398,6 +1398,54 @@ async fn block_cache_is_invalidated_when_the_object_changes() {
 }
 
 #[tokio::test]
+async fn listing_cache_ttl_bounds_staleness() {
+    // Both listing strategies share one bounded-TTL directory cache. A directory listed
+    // once is served from cache until its TTL expires, then re-listed: entries created
+    // by an external writer become visible only after that window.
+    let (scope, _gateway, client) = setup().await;
+    scope.write_file("data/lcached/a.txt", b"a").await;
+
+    let mut config = scope.config();
+    config.cache.enabled = true;
+    config.cache.listing_ttl_ms = 300;
+    let gateway = HdfsGateway::new(client.clone(), config);
+
+    let list = |gateway: HdfsGateway| async move {
+        let out = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/lcached/".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        out.contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| o.key.unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(list(gateway.clone()).await, vec!["data/lcached/a.txt"]);
+
+    // External writer adds an object: invisible until the cached listing expires.
+    scope.write_file("data/lcached/b.txt", b"b").await;
+    assert_eq!(
+        list(gateway.clone()).await,
+        vec!["data/lcached/a.txt"],
+        "listing must be served from cache within its TTL"
+    );
+
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert_eq!(
+        list(gateway).await,
+        vec!["data/lcached/a.txt", "data/lcached/b.txt"],
+        "listing must be re-read after its TTL"
+    );
+}
+
+#[tokio::test]
 async fn cache_kill_switch_bypasses_caching() {
     // With caches disabled (the incident kill switch), long TTLs must have NO effect:
     // every GET/HEAD/listing re-reads HDFS, so an external write is visible immediately.
