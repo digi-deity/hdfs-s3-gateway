@@ -668,7 +668,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -872,8 +872,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hdfs-native"
-version = "0.14.3"
-source = "git+https://github.com/Kimahriman/hdfs-native?rev=e69a26ce151a4f8a0df4e08b25681edcc1e7ca25#e69a26ce151a4f8a0df4e08b25681edcc1e7ca25"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5141c4b745cab57a0018daa9c2759c92308bcf4e41e0c617d05fbf9639c16754"
 dependencies = [
  "aes",
  "base64",
@@ -905,6 +906,7 @@ dependencies = [
  "socket2",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "url",
  "uuid",
  "whoami",
@@ -1757,7 +1759,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2368,13 +2370,14 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.18"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]
