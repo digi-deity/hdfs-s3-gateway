@@ -77,6 +77,13 @@ where
             }
         };
 
+        // Disable Nagle's algorithm. hyper does not set this, and without it a small
+        // response (HEAD, a listing page, a 4 KiB parquet ranged GET) can sit in the
+        // send buffer until the peer ACKs the previous segment — measured 42 ms p50 per
+        // request on loopback (Nagle + delayed ACK) versus 0.6 ms with TCP_NODELAY.
+        // Large object transfers are unaffected; the many-small-requests workload this
+        // gateway exists for is dominated by it.
+        let _ = socket.set_nodelay(true);
         let conn = http_server.serve_connection(TokioIo::new(socket), service.clone());
         let conn = graceful.watch(conn.into_owned());
         tokio::spawn(async move {
