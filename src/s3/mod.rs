@@ -522,14 +522,35 @@ impl S3 for HdfsGateway {
                 }
             }
 
-            let page = paginate(
-                &files,
-                &dirs,
-                &prefix,
-                delimiter,
-                start_after.as_deref(),
-                max_keys,
-            );
+            // Both paginators need per-kind arrays in *output* order:
+            // - files: raw UTF-8 key bytes (HDFS's Java String order differs for
+            //   astral-plane characters, so sort explicitly);
+            // - directories: `dir + "/"` order, which is not raw key order when sibling
+            //   names are prefixes of each other (`0` vs `0 `).
+            files.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
+            dirs.sort_by(|a, b| crate::core::cmp_dir_keys(a, b));
+            let page = if delimiter == Some("/") {
+                // Canonical delimiter: collapse is always `dir + "/"`, so each kind's
+                // key order is monotone and resumption is a binary search (O(log n)).
+                crate::core::paginate_slash(
+                    &files,
+                    &dirs,
+                    &prefix,
+                    start_after.as_deref(),
+                    max_keys,
+                )
+            } else {
+                // Rare non-"/" delimiter: the collapse depends on the prefix, so keep
+                // the general (linear) paginator.
+                paginate(
+                    &files,
+                    &dirs,
+                    &prefix,
+                    delimiter,
+                    start_after.as_deref(),
+                    max_keys,
+                )
+            };
             (
                 page.contents,
                 page.common_prefixes,
@@ -551,8 +572,11 @@ impl S3 for HdfsGateway {
                 // it): S3 semantics — an empty listing, not an error.
                 None => (Vec::new(), false),
                 Some(hdfs_start) => {
-                    let lister: Arc<dyn DirLister> =
-                        Arc::new(HdfsDirLister::new(self.client.clone(), log.span.clone()));
+                    let lister: Arc<dyn DirLister> = Arc::new(HdfsDirLister::new(
+                        self.client.clone(),
+                        self.mapper.clone(),
+                        log.span.clone(),
+                    ));
                     let mut listing = SortedListing::new(
                         lister,
                         hdfs_start,

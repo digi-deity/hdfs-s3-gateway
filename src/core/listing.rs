@@ -1,12 +1,30 @@
 //! Listing translation logic: turning a flat list of HDFS paths into S3 `Contents` and
 //! `CommonPrefixes`, plus continuation-token pagination. Pure logic, no `s3s` types.
 
+use std::cmp::Ordering;
+use std::sync::Arc;
+
 /// A single object entry produced by listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListEntry {
     pub key: String,
     pub size: u64,
     pub modification_time: u64,
+}
+
+/// One directory's direct children, mapped to S3 keys, split by kind, and each array in
+/// the order the listing emits them: `files` by key bytes, `dirs` by their output key
+/// (`dir + "/"`, see [`cmp_dir_keys`]).
+///
+/// Splitting by kind is what makes paginated resumption exact: a file's output key is
+/// its key, while a directory's output key (`dir + "/"`) can sort *after* sibling files
+/// whose names extend the directory's (`a/b` vs `a/b.txt`: `/` 0x2F > `.` 0x2E). One
+/// array ordered by raw keys therefore has no monotone "resume here" predicate; one
+/// array per kind does.
+#[derive(Debug, Clone, Default)]
+pub struct DirListing {
+    pub files: Arc<[ListEntry]>,
+    pub dirs: Arc<[String]>,
 }
 
 /// A set of common prefixes (subdirectory collapses) keyed by the prefix string.
@@ -181,6 +199,160 @@ pub fn paginate(
         common_prefixes,
         is_truncated,
         next_token,
+    }
+}
+
+/// Compare a directory's output key (`dir + "/"`) with `other`, without allocating.
+pub fn cmp_dir_output(dir: &str, other: &str) -> Ordering {
+    let d = dir.as_bytes();
+    let o = other.as_bytes();
+    let common = d.len().min(o.len());
+    match d[..common].cmp(&o[..common]) {
+        // `d + "/"` is greater whenever `d` already exhausts `other`.
+        Ordering::Equal if d.len() >= o.len() => Ordering::Greater,
+        // `d` is a strict prefix of `other`: compare the appended `/` with its next byte.
+        Ordering::Equal => b'/'.cmp(&o[d.len()]),
+        other => other,
+    }
+}
+
+/// Compare two directories' output keys (`a + "/"` vs `b + "/"`), without allocating.
+///
+/// This is NOT the same order as comparing `a` with `b`: sibling names can be string
+/// prefixes of each other (`0` vs `0 `), and appending `/` then compares the delimiter
+/// against the longer name's next byte, which can flip their order. Listing directories
+/// must be stored in THIS order so that "first entry after the marker" is a monotone
+/// predicate (see [`paginate_slash`]).
+pub fn cmp_dir_keys(a: &str, b: &str) -> Ordering {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let common = a.len().min(b.len());
+    match a[..common].cmp(&b[..common]) {
+        Ordering::Equal if a.len() == b.len() => Ordering::Equal,
+        Ordering::Equal if a.len() < b.len() => b'/'.cmp(&b[a.len()]),
+        Ordering::Equal => a[b.len()].cmp(&b'/'),
+        other => other,
+    }
+}
+
+/// Compare a file key with a directory's output key (`dir + "/"`), without allocating.
+pub fn cmp_file_dir(file: &str, dir: &str) -> Ordering {
+    cmp_dir_output(dir, file).reverse()
+}
+
+/// True when a directory's output key (`dir + "/"`) starts with `prefix`, without
+/// allocating.
+fn dir_output_starts_with(dir: &str, prefix: &str) -> bool {
+    let d = dir.as_bytes();
+    let p = prefix.as_bytes();
+    if p.len() <= d.len() {
+        d.starts_with(p)
+    } else {
+        p.len() == d.len() + 1 && p.starts_with(d) && p[d.len()] == b'/'
+    }
+}
+
+/// Paginate a delimiter'd listing for the canonical `/` delimiter from per-kind arrays
+/// already sorted by key, in `O(log n + page)` instead of `O(n log n)`.
+///
+/// Equivalent to [`paginate`] with `delimiter = Some("/")` **for the inputs the S3 layer
+/// passes**: the direct children of the prefix's directory. That restriction is what
+/// makes the collapse exactly `dir + "/"` (a direct child's key has no `/` in its
+/// remainder, so `rest.find(delimiter)` can never fire) and therefore what makes the two
+/// per-kind key orders monotone:
+///
+/// - files stream: output key == `entry.key`, sorted by key;
+/// - directories stream: output key == `dir + "/"`, sorted by [`cmp_dir_keys`] (which is
+///   not raw key order: sibling names can be prefixes of each other);
+/// - the prefix range and the `marker` bound are contiguous lower bounds in each stream,
+///   found with `partition_point`, and the two streams are merged as they are emitted.
+///
+/// Non-`/` delimiters keep using [`paginate`], whose collapse depends on the prefix.
+pub fn paginate_slash(
+    files: &[ListEntry],
+    dirs: &[String],
+    prefix: &str,
+    marker: Option<&str>,
+    max_keys: usize,
+) -> Page {
+    if max_keys == 0 {
+        return Page {
+            contents: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_token: None,
+        };
+    }
+
+    // Lower bounds: the prefix range start, then the continuation marker (strictly
+    // greater, matching S3).
+    let mut fi = files.partition_point(|f| f.key.as_str() < prefix);
+    // Lower bound for the prefix range: FIRST output >= prefix. `!starts_with` is not
+    // monotone (entries after the range do not start with it either), so compare
+    // against the prefix itself.
+    let mut di = dirs.partition_point(|d| cmp_dir_output(d, prefix) == Ordering::Less);
+    if let Some(marker) = marker {
+        fi = fi.max(files.partition_point(|f| f.key.as_bytes() <= marker.as_bytes()));
+        di = di.max(dirs.partition_point(|d| cmp_dir_output(d, marker) != Ordering::Greater));
+    }
+
+    let mut contents: Vec<ListEntry> = Vec::new();
+    let mut common_prefixes: Vec<String> = Vec::new();
+    let mut last_key: Option<String> = None;
+    let mut is_truncated = false;
+
+    loop {
+        // Drop candidates outside the prefix range. The range is contiguous in each
+        // sorted stream: below it we skip, above it the stream is finished.
+        while fi < files.len() && !files[fi].key.starts_with(prefix) {
+            if files[fi].key.as_str() > prefix {
+                fi = files.len();
+            } else {
+                fi += 1;
+            }
+        }
+        while di < dirs.len() && !dir_output_starts_with(&dirs[di], prefix) {
+            if cmp_dir_output(&dirs[di], prefix) == Ordering::Greater {
+                di = dirs.len();
+            } else {
+                di += 1;
+            }
+        }
+
+        let next_file = files.get(fi);
+        let next_dir = dirs.get(di);
+        if next_file.is_none() && next_dir.is_none() {
+            break;
+        }
+        if contents.len() + common_prefixes.len() == max_keys {
+            is_truncated = true;
+            break;
+        }
+
+        // Merge the two sorted streams by output key.
+        let take_file = match (next_file, next_dir) {
+            (Some(file), Some(dir)) => cmp_dir_output(dir, &file.key) == Ordering::Greater,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => unreachable!(),
+        };
+        if take_file {
+            let file = files[fi].clone();
+            fi += 1;
+            last_key = Some(file.key.clone());
+            contents.push(file);
+        } else {
+            let output = format!("{}/", dirs[di]);
+            di += 1;
+            last_key = Some(output.clone());
+            common_prefixes.push(output);
+        }
+    }
+
+    Page {
+        contents,
+        common_prefixes,
+        is_truncated,
+        next_token: if is_truncated { last_key } else { None },
     }
 }
 
@@ -505,6 +677,122 @@ mod tests {
         // A couple of empty directories: they must surface as CommonPrefixes.
         dirs.insert(format!("{}/empty", keys.iter().next().unwrap()));
         (files, dirs.into_iter().collect())
+    }
+
+    /// The S3 directory part of a prefix (`""` for the bucket root).
+    fn dir_part(prefix: &str) -> &str {
+        prefix.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+    }
+
+    /// Keep only the entries that are DIRECT children of the prefix's directory — the
+    /// exact shape the S3 layer feeds both paginators.
+    fn direct_children(
+        files: &[ListEntry],
+        dirs: &[String],
+        prefix: &str,
+    ) -> (Vec<ListEntry>, Vec<String>) {
+        let parent = dir_part(prefix);
+        let keep = |key: &str| match key.rsplit_once('/') {
+            Some((dir, _)) => dir == parent,
+            None => parent.is_empty(),
+        };
+        let files: Vec<ListEntry> = files.iter().filter(|f| keep(&f.key)).cloned().collect();
+        let mut dirs: Vec<String> = dirs.iter().filter(|d| keep(d)).cloned().collect();
+        // The paginators require their documented input order.
+        dirs.sort_by(|a, b| cmp_dir_keys(a, b));
+        (files, dirs)
+    }
+
+    /// Walk a delimiter'd listing with the production paginator (`paginate_slash` for
+    /// `/`, the general `paginate` otherwise), asserting order/uniqueness/termination.
+    fn walk_slash_pages(
+        files: &[ListEntry],
+        dirs: &[String],
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut marker = start_after.map(str::to_string);
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= files.len() + dirs.len() + 2,
+                "pagination must terminate"
+            );
+            let page = paginate_slash(files, dirs, prefix, marker.as_deref(), max_keys);
+            let keys = page_keys(&page);
+            if page.is_truncated {
+                assert!(page.next_token.is_some());
+                assert!(!keys.is_empty());
+            }
+            for key in &keys {
+                if let Some(prev) = out.last() {
+                    assert!(prev.as_str() < key.as_str(), "{prev:?} then {key:?}");
+                }
+                out.push(key.clone());
+            }
+            match page.next_token {
+                Some(token) => marker = Some(token),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn paginate_slash_matches_general_paginate() {
+        // `paginate_slash` is the O(log n + page) fast path used for the canonical `/`
+        // delimiter. It must agree page-for-page with the general paginator on the
+        // inputs the S3 layer actually produces (the direct children of the prefix's
+        // directory) — including sibling names that are prefixes of each other
+        // (`0`, `0 `), where `dir + "/"` does not preserve raw-key order.
+        let (files, dirs) = adversarial_namespace(3, 150);
+        for prefix in ["", "a", "a/", "a.b", "!", "0"] {
+            let (files, dirs) = direct_children(&files, &dirs, prefix);
+            let one = page_keys(&paginate_slash(&files, &dirs, prefix, None, usize::MAX));
+            for max_keys in [1, 2, 3, 5, 7] {
+                let walked = walk_slash_pages(&files, &dirs, prefix, None, max_keys);
+                assert_eq!(walked, one, "prefix={prefix:?} max_keys={max_keys}");
+            }
+            for marker in [
+                None,
+                Some("a"),
+                Some("a/"),
+                Some("0"),
+                Some("0 "),
+                Some("0."),
+            ] {
+                let expected: Vec<String> = one
+                    .iter()
+                    .filter(|k| marker.map_or(true, |m: &str| k.as_str() > m))
+                    .cloned()
+                    .collect();
+                for max_keys in [1, 2, 4] {
+                    let walked = walk_slash_pages(&files, &dirs, prefix, marker, max_keys);
+                    assert_eq!(
+                        walked, expected,
+                        "prefix={prefix:?} marker={marker:?} max_keys={max_keys}"
+                    );
+                }
+
+                // Agree with the general paginator page by page, including which keys
+                // land on which page and the continuation token.
+                let mut marker = marker.map(str::to_string);
+                loop {
+                    let fast = paginate_slash(&files, &dirs, prefix, marker.as_deref(), 3);
+                    let general = paginate(&files, &dirs, prefix, Some("/"), marker.as_deref(), 3);
+                    assert_eq!(page_keys(&fast), page_keys(&general), "prefix={prefix:?}");
+                    assert_eq!(fast.is_truncated, general.is_truncated);
+                    assert_eq!(fast.next_token, general.next_token);
+                    match fast.next_token {
+                        Some(token) => marker = Some(token),
+                        None => break,
+                    }
+                }
+            }
+        }
     }
 
     /// The keys of one page in output order: Contents and CommonPrefixes are each
