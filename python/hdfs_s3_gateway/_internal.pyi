@@ -11,9 +11,13 @@ class Gateway:
         hdfs_root: Optional[str] = None,
         bucket_name: Optional[str] = None,
         listen_addr: Optional[str] = None,
+        auth_secret: Optional[str] = None,
+        cache_enabled: Optional[bool] = None,
     ) -> None: ...
     @property
     def listen_addr(self) -> str: ...
+    @property
+    def cache_enabled(self) -> bool: ...
     @property
     def address(self) -> Optional[str]: ...
     @property

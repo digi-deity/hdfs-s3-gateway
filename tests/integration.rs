@@ -1323,10 +1323,12 @@ async fn metadata_cache_ttl_bounds_staleness() {
     };
 
     let mut long = scope.config();
+    long.cache.enabled = true;
     long.cache.metadata_ttl_ms = 60_000;
     let long = HdfsGateway::new(client.clone(), long);
 
     let mut short = scope.config();
+    short.cache.enabled = true;
     short.cache.metadata_ttl_ms = 200;
     let short = HdfsGateway::new(client.clone(), short);
 
@@ -1363,6 +1365,7 @@ async fn block_cache_is_invalidated_when_the_object_changes() {
     scope.write_file("data/cache/b.bin", b"aaaa").await;
 
     let mut config = scope.config();
+    config.cache.enabled = true;
     config.cache.metadata_ttl_ms = 50;
     config.cache.blocks_ttl_ms = 60_000;
     let gateway = HdfsGateway::new(client.clone(), config);
@@ -1391,5 +1394,70 @@ async fn block_cache_is_invalidated_when_the_object_changes() {
         get(gateway).await,
         b"bbbbbbbb",
         "a stale block map must not be reused for a changed object"
+    );
+}
+
+#[tokio::test]
+async fn cache_kill_switch_bypasses_caching() {
+    // With caches disabled (the incident kill switch), long TTLs must have NO effect:
+    // every GET/HEAD/listing re-reads HDFS, so an external write is visible immediately.
+    // This is the escape hatch an operator can use without a release if a cache bug is
+    // suspected.
+    let (scope, _gateway, client) = setup().await;
+    scope.write_file("data/kill/a.txt", b"aaaa").await;
+
+    let mut config = scope.config();
+    config.cache.enabled = false;
+    config.cache.metadata_ttl_ms = 60_000;
+    config.cache.blocks_ttl_ms = 60_000;
+    config.cache.listing_ttl_ms = 60_000;
+    let gateway = HdfsGateway::new(client.clone(), config);
+
+    let head_len = |gateway: HdfsGateway| async move {
+        gateway
+            .head_object(req(HeadObjectInput {
+                bucket: "hdfs".into(),
+                key: "data/kill/a.txt".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output
+            .content_length
+            .unwrap()
+    };
+    let keys = |gateway: HdfsGateway| async move {
+        gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/kill/".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| o.key.unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    // Prime everything, then write externally.
+    assert_eq!(head_len(gateway.clone()).await, 4);
+    assert_eq!(keys(gateway.clone()).await, vec!["data/kill/a.txt"]);
+    scope.write_file("data/kill/a.txt", b"aaaaaa").await;
+    scope.write_file("data/kill/b.txt", b"b").await;
+
+    // No TTL applies: the new length and the new object are visible immediately.
+    assert_eq!(
+        head_len(gateway.clone()).await,
+        6,
+        "disabled metadata cache must not serve stale length"
+    );
+    assert_eq!(
+        keys(gateway).await,
+        vec!["data/kill/a.txt", "data/kill/b.txt"],
+        "disabled listing cache must not serve a stale directory"
     );
 }

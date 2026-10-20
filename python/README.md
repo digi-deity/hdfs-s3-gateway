@@ -22,6 +22,13 @@ with Gateway(config_path="gateway.toml") as gw:
     # ... use the endpoint ...
 ```
 
+Caches (metadata, block maps, directory listings) are **off by default**. Enable them for
+read-heavy workloads with `Gateway(..., cache_enabled=True)` (or `[cache] enabled = true`
+/ `HDFS_S3_CACHE_ENABLED=1`). The same argument is the incident kill switch: pass
+`cache_enabled=False` to bypass the caches without waiting for a release, and read
+`gw.cache_enabled` to confirm the effective value. Within a TTL, an object written by
+another client may not be visible yet.
+
 The gateway performs **no authentication by default** — it must run behind network-level
 access control. See the top-level project README for the full security posture. You can
 optionally enable SigV4 auth by passing `auth_secret="..."` to `Gateway(...)` (or the

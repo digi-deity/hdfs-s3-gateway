@@ -99,6 +99,8 @@ def gateway(
     hdfs_root: Optional[str] = None,
     bucket_name: Optional[str] = None,
     listen_addr: Optional[str] = None,
+    auth_secret: Optional[str] = None,
+    cache_enabled: Optional[bool] = None,
 ) -> "Gateway":
     """Construct a :class:`Gateway`.
 
@@ -107,8 +109,14 @@ def gateway(
     config_path:
         Optional path to a TOML configuration file. If omitted, configuration is taken
         from environment variables and the keyword overrides below.
-    namenode_uri, hdfs_root, bucket_name, listen_addr:
+    namenode_uri, hdfs_root, bucket_name, listen_addr, auth_secret:
         Optional overrides applied on top of the config file / environment.
+    cache_enabled:
+        Highest-precedence switch for the metadata / block-map / directory-listing
+        caches (overrides ``[cache] enabled`` and ``HDFS_S3_CACHE_ENABLED``). Caches
+        are **off by default**; pass ``True`` to enable them, or ``False`` as an
+        incident kill switch if a cache bug is suspected. Check the effective value
+        with :attr:`Gateway.cache_enabled`.
     Logging is configured process-globally via :func:`set_logging` and is frozen once the
     first gateway is created. By default the gateway is **silent** and emits no logs
     (unless ``RUST_LOG`` is set). Logs never go to Python's ``stdout``.
@@ -123,6 +131,8 @@ def gateway(
             hdfs_root=hdfs_root,
             bucket_name=bucket_name,
             listen_addr=listen_addr,
+            auth_secret=auth_secret,
+            cache_enabled=cache_enabled,
             log_level=log_level,
             log_to=log_target,
         )
@@ -133,6 +143,8 @@ def gateway(
             hdfs_root=hdfs_root,
             bucket_name=bucket_name,
             listen_addr=listen_addr,
+            auth_secret=auth_secret,
+            cache_enabled=cache_enabled,
             log_level=log_level,
             log_to=log_target,
         )
@@ -148,6 +160,8 @@ def serving(
     hdfs_root: Optional[str] = None,
     bucket_name: Optional[str] = None,
     listen_addr: Optional[str] = None,
+    auth_secret: Optional[str] = None,
+    cache_enabled: Optional[bool] = None,
 ) -> Iterator[Gateway]:
     """Context manager that starts the gateway in the background and stops it on exit.
 
@@ -169,6 +183,8 @@ def serving(
         hdfs_root=hdfs_root,
         bucket_name=bucket_name,
         listen_addr=listen_addr,
+        auth_secret=auth_secret,
+        cache_enabled=cache_enabled,
     )
     gw.start()
     try:

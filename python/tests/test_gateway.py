@@ -218,3 +218,33 @@ def _run(code: str):
     )
     assert proc.returncode == 0, f"subprocess failed: {proc.stderr}"
     return proc.stdout, proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Cache kill switch
+# --------------------------------------------------------------------------- #
+
+
+def test_cache_enabled_kwarg_and_default():
+    # Caches are opt-in: the default is disabled, and the constructor argument is the
+    # highest-precedence switch (the incident lever, no release needed to flip it).
+    assert gateway(listen_addr=LISTEN, **KW).cache_enabled is False
+    assert (
+        gateway(listen_addr=LISTEN, cache_enabled=True, **KW).cache_enabled is True
+    )
+    assert (
+        gateway(listen_addr=LISTEN, cache_enabled=False, **KW).cache_enabled is False
+    )
+
+
+def test_cache_env_var_applies_to_python_bindings(monkeypatch):
+    # Deployments that can only change the environment can still flip the kill switch.
+    monkeypatch.setenv("HDFS_S3_CACHE_ENABLED", "1")
+    assert gateway(listen_addr=LISTEN, **KW).cache_enabled is True
+
+    monkeypatch.setenv("HDFS_S3_CACHE_ENABLED", "0")
+    # The explicit Python argument still wins over the environment.
+    assert gateway(listen_addr=LISTEN, **KW).cache_enabled is False
+    assert (
+        gateway(listen_addr=LISTEN, cache_enabled=True, **KW).cache_enabled is True
+    )

@@ -231,7 +231,7 @@ struct Gateway {
 #[pymethods]
 impl Gateway {
     #[new]
-    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, auth_secret=None, log_level=None, log_to=None))]
+    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, auth_secret=None, cache_enabled=None, log_level=None, log_to=None))]
     fn new(
         config_path: Option<PathBuf>,
         namenode_uri: Option<String>,
@@ -239,6 +239,7 @@ impl Gateway {
         bucket_name: Option<String>,
         listen_addr: Option<String>,
         auth_secret: Option<String>,
+        cache_enabled: Option<bool>,
         log_level: Option<String>,
         log_to: Option<String>,
     ) -> PyResult<Self> {
@@ -249,9 +250,16 @@ impl Gateway {
             hdfs_root,
             bucket_name,
             auth_secret,
+            // `cache_enabled` is applied after load (highest precedence), matching the
+            // Rust CLI's --cache/--no-cache flags.
+            no_cache: false,
+            cache: false,
         };
-        let config = Config::load(&args)
+        let mut config = Config::load(&args)
             .map_err(|e| PyValueError::new_err(format!("invalid configuration: {e}")))?;
+        if let Some(enabled) = cache_enabled {
+            config.cache.enabled = enabled;
+        }
         Ok(Gateway {
             config: Arc::new(config),
             shutdown: Arc::new(Notify::new()),
@@ -274,6 +282,14 @@ impl Gateway {
     #[getter]
     fn address(&self) -> Option<String> {
         self.address.clone()
+    }
+
+    /// Whether the metadata / block-map / directory-listing caches are enabled, as
+    /// resolved from the config file, `HDFS_S3_CACHE_ENABLED`, and the `cache_enabled`
+    /// constructor argument (highest precedence). Caches are OFF by default.
+    #[getter]
+    fn cache_enabled(&self) -> bool {
+        self.config.cache.enabled
     }
 
     /// Run the gateway in the foreground, blocking the calling Python thread until
