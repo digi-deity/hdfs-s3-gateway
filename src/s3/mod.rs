@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-use crate::core::{decode_token, encode_token, paginate, ListEntry, ObjectMetadata, PathMapper};
+use crate::core::{decode_token, encode_token, paginate, DirListing, ObjectMetadata, PathMapper};
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
@@ -554,23 +554,27 @@ impl S3 for HdfsGateway {
             // directories (only files became entries), but detecting emptiness would
             // cost one extra RPC per directory — the very amplification this
             // single-listing path exists to avoid. The namespace is surfaced as-is.
-            let statuses = match self.mapper.list_start(&prefix) {
+            // Both listing strategies use the same cached, key-mapped lister, so a
+            // repeated page (or a flat listing of the same directory) costs no NameNode
+            // round trip, no path normalization and no re-sort — only the page slice.
+            let lister: Arc<dyn DirLister> = Arc::new(HdfsDirLister::new(
+                self.client.clone(),
+                self.mapper.clone(),
+                Arc::clone(&self.cache),
+                log.span.clone(),
+            ));
+            let listing = match self.mapper.list_start(&prefix) {
                 // The prefix cannot match any key under the root (e.g. it escapes it):
                 // S3 semantics — an empty listing, not an error.
-                None => Vec::new(),
-                Some(hdfs_start) => match self
-                    .client
-                    .list_status(&hdfs_start, false)
-                    .instrument(log.span.clone())
-                    .await
-                {
-                    Ok(statuses) => statuses,
+                None => Arc::new(DirListing::default()),
+                Some(hdfs_start) => match lister.list_dir(hdfs_start).await {
+                    Ok(listing) => listing,
                     // The prefix's directory does not exist (or the prefix points at a
                     // file, which the NameNode `getListing` reports the same way):
                     // nothing can match — an empty listing, not an error. Clients probe
                     // non-existent prefixes (e.g. `table/partition=x/` before it exists)
                     // constantly, and real S3 answers those with an empty page.
-                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Vec::new(),
+                    Err(hdfs_native::HdfsError::FileNotFound(_)) => Arc::new(DirListing::default()),
                     Err(e) => {
                         return Err(
                             log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
@@ -579,39 +583,12 @@ impl S3 for HdfsGateway {
                 },
             };
 
-            let mut files: Vec<ListEntry> = Vec::new();
-            let mut dirs: Vec<String> = Vec::new();
-            for s in statuses {
-                let Some(key) = self.mapper.hdfs_path_to_key(&s.path) else {
-                    continue;
-                };
-                if key.is_empty() {
-                    continue;
-                }
-                if s.isdir {
-                    dirs.push(key);
-                } else {
-                    files.push(ListEntry {
-                        key,
-                        size: s.length as u64,
-                        modification_time: s.modification_time,
-                    });
-                }
-            }
-
-            // Both paginators need per-kind arrays in *output* order:
-            // - files: raw UTF-8 key bytes (HDFS's Java String order differs for
-            //   astral-plane characters, so sort explicitly);
-            // - directories: `dir + "/"` order, which is not raw key order when sibling
-            //   names are prefixes of each other (`0` vs `0 `).
-            files.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
-            dirs.sort_by(|a, b| crate::core::cmp_dir_keys(a, b));
             let page = if delimiter == Some("/") {
                 // Canonical delimiter: collapse is always `dir + "/"`, so each kind's
                 // key order is monotone and resumption is a binary search (O(log n)).
                 crate::core::paginate_slash(
-                    &files,
-                    &dirs,
+                    &listing.files,
+                    &listing.dirs,
                     &prefix,
                     start_after.as_deref(),
                     max_keys,
@@ -620,8 +597,8 @@ impl S3 for HdfsGateway {
                 // Rare non-"/" delimiter: the collapse depends on the prefix, so keep
                 // the general (linear) paginator.
                 paginate(
-                    &files,
-                    &dirs,
+                    &listing.files,
+                    &listing.dirs,
                     &prefix,
                     delimiter,
                     start_after.as_deref(),
@@ -652,6 +629,7 @@ impl S3 for HdfsGateway {
                     let lister: Arc<dyn DirLister> = Arc::new(HdfsDirLister::new(
                         self.client.clone(),
                         self.mapper.clone(),
+                        Arc::clone(&self.cache),
                         log.span.clone(),
                     ));
                     let mut listing = SortedListing::new(

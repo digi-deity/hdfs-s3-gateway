@@ -13,7 +13,7 @@ use std::sync::Arc;
 use hdfs_native::file::FileReader;
 
 use crate::config::CacheConfig;
-use crate::core::TtlCache;
+use crate::core::{DirListing, TtlCache};
 
 /// The HDFS metadata the S3 layer needs, cached instead of the full `FileStatus` (which
 /// carries a path `String` and listing-only fields). `Copy` so every hit is free.
@@ -55,6 +55,10 @@ pub struct Caches {
     pub negative: TtlCache<String, ()>,
     /// Block maps keyed by absolute HDFS path.
     pub blocks: TtlCache<String, CachedReader>,
+    /// Non-recursive directory listings keyed by absolute HDFS directory path.
+    pub dirs: TtlCache<String, Arc<DirListing>>,
+    /// Directories larger than this are served but never cached (scan resistance).
+    pub max_dir_entries: usize,
 }
 
 impl Caches {
@@ -75,6 +79,12 @@ impl Caches {
                 ttl(config, config.blocks_ttl_ms),
                 config.blocks_capacity,
             ),
+            dirs: TtlCache::new(
+                capacity(config.listing_capacity_entries),
+                ttl(config, config.listing_ttl_ms),
+                config.listing_capacity_entries,
+            ),
+            max_dir_entries: config.listing_max_dir_entries,
         }
     }
 }

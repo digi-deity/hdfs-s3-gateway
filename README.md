@@ -68,6 +68,7 @@ fast at startup.
 | `hdfs_config_dir` | — | — | `None` | Optional → `with_config_dir`; **replaces** `HADOOP_CONF_DIR`/`HADOOP_HOME` fallback when set |
 | `hdfs_user` | — | — | `None` | Optional → `with_user`; else `HADOOP_USER_NAME`/`HADOOP_PROXY_USER` |
 | `auth_secret` | `AUTH_SECRET` | `--auth-secret` | `None` | Optional shared secret. When **unset** (default), the gateway accepts **both** anonymous and any signed request. When **set**, a valid SigV4 signature is **required** (unsigned → `403`, wrong secret → `403 SignatureDoesNotMatch`). Not user identity — a shared password. |
+| `[cache] enabled` | `HDFS_S3_CACHE_ENABLED` | `--cache` / `--no-cache` | `false` | Opt-in metadata/block-map/listing caches. `--no-cache` is the highest-precedence incident kill switch (see [caching](#caching--consistency)). |
 
 Example `config.toml`:
 
@@ -80,7 +81,20 @@ max_concurrent_requests = 2048
 
 # Optional: raw Hadoop config overrides
 hdfs_options = { "dfs.client.use.datanode.hostname" = "true" }
+
+# Optional: bounded TTL caches (off by default). Warm GETs then need no NameNode RPC
+# at all, and repeated listings are served from the merge cache.
+[cache]
+enabled = true            # or HDFS_S3_CACHE_ENABLED=1 / --cache
+metadata_ttl_ms = 1000    # getFileInfo results (GET + HEAD)
+blocks_ttl_ms = 10000     # block maps, revalidated on (length, mtime) every GET
+listing_ttl_ms = 5000     # non-recursive directory listings
 ```
+
+> **Turning the caches off again (no release needed):** set `[cache] enabled = false`,
+> `HDFS_S3_CACHE_ENABLED=0`, or launch with `--no-cache`. In Python, pass
+> `cache_enabled=False` (or check the effective value with `gw.cache_enabled`). The switch
+> is read at startup, so restart the process after changing it.
 
 ---
 
@@ -179,9 +193,11 @@ with serving(listen_addr="127.0.0.1:0") as gw:
 ```
 
 `gateway(...)` / `serving(...)` accept the same options as the CLI: `config_path` (TOML file),
-or the `namenode_uri` / `hdfs_root` / `bucket_name` / `listen_addr` overrides (applied on top of
-the config file / environment). The `Gateway` object exposes `listen_addr`, `address` (the
-actually-bound address, once running), `is_running`, `start()`, `stop()`, and
+or the `namenode_uri` / `hdfs_root` / `bucket_name` / `listen_addr` / `auth_secret` /
+`cache_enabled` overrides (applied on top of the config file / environment).
+`cache_enabled` is the highest-precedence cache switch (see [caching](#caching--consistency)).
+The `Gateway` object exposes `listen_addr`, `address` (the actually-bound address, once
+running), `cache_enabled` (effective value), `is_running`, `start()`, `stop()`, and
 `serve_blocking()`.
 
 > **Process-exit behavior:** the background server runs on a *native* OS thread, not a Python
@@ -347,6 +363,56 @@ Test layout:
 - `tests/conformance.rs` — real-HTTP conformance (headers, ranges, error shapes).
 - `tests/graceful_shutdown.rs` — graceful drain of in-flight GETs + request-id logging.
 - `tests/error_propagation.rs` — `hdfs-native` error → S3 code + server-side log correlation.
+
+---
+
+## Caching & consistency
+
+The gateway is **read-only**: the only writes it can observe come from clients *outside*
+it, and the NameNode offers no change-notification channel. It therefore ships with three
+optional, bounded TTL caches, all **off by default** (`[cache] enabled = true` turns them
+on; each has its own TTL and budget):
+
+| cache | what it removes from the hot path | default TTL |
+|---|---|---|
+| metadata | `getFileInfo` per GET/HEAD (clients HEAD then issue many ranged GETs) | 1 s |
+| block maps | `getBlockLocations` per GET — hdfs-native fetches the **whole** block list, so this dominates ranged reads on large objects | 10 s |
+| directory listings | the per-page `getListing` + path mapping + re-sort for both listing strategies | 5 s |
+| negative | lookups of missing keys (`_SUCCESS`, `_common_metadata` probes) | 1 s |
+
+All caches are LRU with a **weighted** budget (a directory listing is far larger than a
+file stat), and a single listing larger than `listing_max_dir_entries` is served but never
+cached, so one huge directory scan cannot flush everything else.
+
+**The trade-off, stated plainly:** within the TTL, an object or directory changed by an
+external writer may not be visible yet; a GET may serve the previous bytes (ETag,
+Last-Modified and listing entries all come from the same cached metadata, so they stay
+internally consistent with each other). After the TTL the next request re-reads HDFS.
+That is the right trade for read-heavy analytics/parquet workloads, and the wrong one if
+your clients expect immediate external-write visibility — which is why it is opt-in.
+
+**Incident kill switch.** If a cache is ever suspected of a bug, disable it without a new
+release, in increasing order of intrusiveness:
+
+```bash
+# 1. environment (restart the process / container)
+HDFS_S3_CACHE_ENABLED=0 hdfs-s3-gateway --config config.toml
+# 2. launch flag (no config edit)
+hdfs-s3-gateway --config config.toml --no-cache
+# 3. config file: [cache] enabled = false
+```
+
+In Python: `gateway(..., cache_enabled=False)` (or `serving(..., cache_enabled=False)`),
+and `gw.cache_enabled` reports the effective value. `--cache` / `HDFS_S3_CACHE_ENABLED=1` /
+`cache_enabled=True` force it on with the same precedence (flags beat env beats config
+file). A malformed `HDFS_S3_CACHE_ENABLED` fails startup rather than silently leaving
+caches at whatever the file said.
+
+**Known upstream limitation the block cache papers over:** `hdfs-native`'s `Client::read`
+requests `getBlockLocations(path, 0, i64::MAX)` — the entire block list — even for a 4 KiB
+range. The cache removes that from repeated reads of the same object, but the first read
+of a very large object still transfers its full block map. Passing the requested window
+upstream (or HDFS's 10-block prefetch) is the proper fix.
 
 ---
 

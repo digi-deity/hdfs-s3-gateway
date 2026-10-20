@@ -83,16 +83,23 @@ pub trait DirLister: Send + Sync {
 pub struct HdfsDirLister {
     client: Arc<Client>,
     mapper: PathMapper,
+    cache: Arc<crate::s3::cache::Caches>,
     span: tracing::Span,
 }
 
 impl HdfsDirLister {
     /// `span` is the request log span; upstream diagnostics stay correlated to the
     /// request that triggered them (same pattern as the other gateway call sites).
-    pub fn new(client: Arc<Client>, mapper: PathMapper, span: tracing::Span) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        mapper: PathMapper,
+        cache: Arc<crate::s3::cache::Caches>,
+        span: tracing::Span,
+    ) -> Self {
         HdfsDirLister {
             client,
             mapper,
+            cache,
             span,
         }
     }
@@ -102,10 +109,22 @@ impl DirLister for HdfsDirLister {
     fn list_dir(&self, dir: String) -> BoxFuture<'static, Result<Arc<DirListing>, HdfsError>> {
         let client = self.client.clone();
         let mapper = self.mapper.clone();
+        let cache = Arc::clone(&self.cache);
         let span = self.span.clone();
         Box::pin(async move {
+            if let Some(listing) = cache.dirs.get(&dir) {
+                return Ok(listing);
+            }
             let statuses = client.list_status(&dir, false).instrument(span).await?;
-            Ok(Arc::new(listing_from_statuses(statuses, &mapper)))
+            let listing = Arc::new(listing_from_statuses(statuses, &mapper));
+            // Remember the listing for a few seconds. Oversized directories are served
+            // but never cached: one such listing would evict everything else and still
+            // exceed the budget (a scan must not be able to flush the cache).
+            let weight = listing.files.len() + listing.dirs.len();
+            if weight <= cache.max_dir_entries {
+                cache.dirs.insert(dir, Arc::clone(&listing), weight);
+            }
+            Ok(listing)
         })
     }
 }
