@@ -93,6 +93,11 @@ pub struct Config {
     #[serde(default)]
     pub hdfs_user: Option<String>,
 
+    /// Bounded TTL caches for metadata, block maps and directory listings. Defaults to
+    /// safe, short TTLs (see [`CacheConfig`]); `[cache] enabled = false` disables them.
+    #[serde(default)]
+    pub cache: CacheConfig,
+
     /// Optional shared secret enabling **optional** S3 SigV4 authentication. When set,
     /// the gateway verifies the signature on *signed* requests (rejecting bad ones) while
     /// still accepting *unsigned* requests — so both client modes work. The gateway never
@@ -103,6 +108,51 @@ pub struct Config {
     /// `aws_skip_signature` flags. This is NOT user identity — it is a shared password.
     #[serde(default)]
     pub auth_secret: Option<String>,
+}
+
+/// Bounded TTL caches for NameNode metadata, block maps and directory listings.
+///
+/// The gateway is read-only: only writers OUTSIDE the gateway can change HDFS, and there
+/// is no invalidation channel from the NameNode. Freshness is therefore bounded by these
+/// TTLs (after which the next request re-reads), and memory by the weight budgets. Set
+/// `enabled = false` to restore one-NameNode-RPC-per-request behaviour.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Master switch. When false every lookup misses and nothing is cached.
+    pub enabled: bool,
+    /// `getFileInfo` results (length/mtime/isdir) reused for GET and HEAD.
+    pub metadata_ttl_ms: u64,
+    /// Cached `FileReader`s (the object's block map) reused for ranged GETs.
+    pub blocks_ttl_ms: u64,
+    /// Non-recursive directory listings reused by both listing strategies.
+    pub listing_ttl_ms: u64,
+    /// Missing paths (S3 probes `_SUCCESS`/`_common_metadata` constantly).
+    pub negative_ttl_ms: u64,
+    /// Maximum number of cached file metadata entries.
+    pub metadata_capacity: usize,
+    /// Maximum number of cached block maps (`FileReader`s).
+    pub blocks_capacity: usize,
+    /// Total weight budget for cached directory listings, in entries.
+    pub listing_capacity_entries: usize,
+    /// Directories larger than this are listed but never cached (scan resistance).
+    pub listing_max_dir_entries: usize,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            enabled: true,
+            metadata_ttl_ms: 1_000,
+            blocks_ttl_ms: 10_000,
+            listing_ttl_ms: 5_000,
+            negative_ttl_ms: 1_000,
+            metadata_capacity: 100_000,
+            blocks_capacity: 512,
+            listing_capacity_entries: 200_000,
+            listing_max_dir_entries: 50_000,
+        }
+    }
 }
 
 fn default_listen_addr() -> String {
@@ -162,6 +212,7 @@ impl Config {
             hdfs_options: HashMap::new(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            cache: CacheConfig::default(),
             auth_secret: None,
         })
     }
@@ -179,6 +230,13 @@ impl Config {
         if self.max_concurrent_requests == 0 {
             return Err(ConfigError::Invalid(
                 "max_concurrent_requests must be greater than 0".into(),
+            ));
+        }
+        // The listing cache weight budget must be able to hold at least one entry,
+        // otherwise caching listings is silently impossible.
+        if self.cache.listing_capacity_entries == 0 && self.cache.listing_ttl_ms > 0 {
+            return Err(ConfigError::Invalid(
+                "cache.listing_capacity_entries must be greater than 0".into(),
             ));
         }
         // Bucket name must be a legal S3 bucket name.
@@ -204,6 +262,7 @@ impl Default for Config {
             hdfs_options: HashMap::new(),
             hdfs_config_dir: None,
             hdfs_user: None,
+            cache: CacheConfig::default(),
             auth_secret: None,
         }
     }
