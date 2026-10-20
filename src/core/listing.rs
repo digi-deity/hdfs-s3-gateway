@@ -110,6 +110,19 @@ pub fn paginate(
     marker: Option<&str>,
     max_keys: usize,
 ) -> Page {
+    // max-keys=0 asks for no keys: the page is empty and NOT truncated. Reporting
+    // truncation would be self-contradictory (there is no last key to mint a token
+    // from) and contradicts S3, whose reference tests assert IsTruncated=false for
+    // MaxKeys=0.
+    if max_keys == 0 {
+        return Page {
+            contents: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_token: None,
+        };
+    }
+
     let (mut contents, common) = list_to_contents(files, prefix, delimiter);
     let mut common_vec = common.into_vec();
 
@@ -430,16 +443,17 @@ mod tests {
     }
 
     #[test]
-    fn paginate_max_keys_zero() {
-        // max-keys=0 keeps the existing semantics: an empty page that is still
-        // "truncated" when any key exists (a client that asked for nothing must be
-        // able to tell there is something to paginate).
+    fn paginate_max_keys_zero_is_not_truncated() {
+        // max-keys=0 asks for no keys: an empty page that is NOT truncated (S3's
+        // reference tests assert IsTruncated=false for MaxKeys=0). Reporting truncation
+        // here used to produce `IsTruncated=true` with no continuation token, a page a
+        // client cannot advance past.
         let files = vec![entry("a/x.txt")];
         let dirs = vec!["a/d".to_string()];
         let page = paginate(&files, &dirs, "a/", Some("/"), None, 0);
         assert!(page.contents.is_empty());
         assert!(page.common_prefixes.is_empty());
-        assert!(page.is_truncated);
+        assert!(!page.is_truncated);
         assert!(page.next_token.is_none());
     }
 }
