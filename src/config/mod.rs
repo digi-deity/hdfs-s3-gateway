@@ -38,6 +38,18 @@ pub struct CliArgs {
     /// are verified (bad signatures rejected) while unsigned requests are still accepted.
     #[arg(long)]
     pub auth_secret: Option<String>,
+
+    /// Force-disable the metadata, block-map and directory-listing caches for this
+    /// process. Incident kill switch: takes precedence over `[cache] enabled` and
+    /// `HDFS_S3_CACHE_ENABLED`, so a suspected cache bug can be mitigated by changing
+    /// only the launch arguments (no new release, no config edit).
+    #[arg(long, conflicts_with = "cache")]
+    pub no_cache: bool,
+
+    /// Force-enable the caches for this process, overriding `[cache] enabled` and
+    /// `HDFS_S3_CACHE_ENABLED`.
+    #[arg(long, conflicts_with = "no_cache")]
+    pub cache: bool,
 }
 
 /// Resolved, validated gateway configuration.
@@ -114,12 +126,18 @@ pub struct Config {
 ///
 /// The gateway is read-only: only writers OUTSIDE the gateway can change HDFS, and there
 /// is no invalidation channel from the NameNode. Freshness is therefore bounded by these
-/// TTLs (after which the next request re-reads), and memory by the weight budgets. Set
-/// `enabled = false` to restore one-NameNode-RPC-per-request behaviour.
+/// TTLs (after which the next request re-reads), and memory by the weight budgets.
+///
+/// **Disabled by default**: enabling them trades read-after-write visibility of an
+/// external writer for fewer NameNode round trips (within the TTL, a just-written object
+/// or listing may not be visible). That is the right trade for read-heavy analytics
+/// workloads and the wrong one when clients expect immediate visibility, so it is an
+/// explicit deployment decision.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
-    /// Master switch. When false every lookup misses and nothing is cached.
+    /// Master switch (default: disabled — see the type docs). When false every lookup
+    /// misses and nothing is cached.
     pub enabled: bool,
     /// `getFileInfo` results (length/mtime/isdir) reused for GET and HEAD.
     pub metadata_ttl_ms: u64,
@@ -142,7 +160,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         CacheConfig {
-            enabled: true,
+            enabled: false,
             metadata_ttl_ms: 1_000,
             blocks_ttl_ms: 10_000,
             listing_ttl_ms: 5_000,
@@ -152,6 +170,22 @@ impl Default for CacheConfig {
             listing_capacity_entries: 200_000,
             listing_max_dir_entries: 50_000,
         }
+    }
+}
+
+/// Parse a boolean environment variable, failing fast on values that are neither clearly
+/// true nor clearly false (a mistyped kill switch must not silently keep caches on).
+fn env_bool(name: &str) -> Result<Option<bool>, ConfigError> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        _ => Err(ConfigError::Invalid(format!(
+            "{name} must be one of 1/0, true/false, yes/no, on/off (got {value:?})"
+        ))),
     }
 }
 
@@ -190,6 +224,21 @@ impl Config {
         }
         if let Some(v) = &args.auth_secret {
             config.auth_secret = Some(v.clone());
+        }
+
+        // Cache kill switch, lowest to highest precedence:
+        //   config file `[cache] enabled`  <  HDFS_S3_CACHE_ENABLED  <  --cache/--no-cache
+        // The env var exists so an operator can flip it without editing the config file
+        // (e.g. via a container env change), and the flags so it can be done without even
+        // that — no new release required if a cache bug is suspected.
+        if let Some(enabled) = env_bool("HDFS_S3_CACHE_ENABLED")? {
+            config.cache.enabled = enabled;
+        }
+        if args.no_cache {
+            config.cache.enabled = false;
+        }
+        if args.cache {
+            config.cache.enabled = true;
         }
 
         config.validate()?;
@@ -281,4 +330,88 @@ pub enum ConfigError {
 
     #[error("invalid config value: {0}")]
     Invalid(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn args(config: Option<PathBuf>) -> CliArgs {
+        CliArgs {
+            config,
+            listen_addr: None,
+            namenode_uri: None,
+            hdfs_root: None,
+            bucket_name: None,
+            auth_secret: None,
+            no_cache: false,
+            cache: false,
+        }
+    }
+
+    fn write_config(cache_enabled: bool) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gateway-cache-toggle-{}-{}.toml",
+            std::process::id(),
+            cache_enabled
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "namenode_uri = \"hdfs://localhost:8020\"\n\
+             hdfs_root = \"/data\"\n\
+             bucket_name = \"hdfs\"\n\
+             [cache]\n\
+             enabled = {cache_enabled}"
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn cache_kill_switch_precedence() {
+        // file says ON; env says OFF; CLI --cache says ON again.
+        let path = write_config(true);
+
+        std::env::remove_var("HDFS_S3_CACHE_ENABLED");
+        assert!(
+            Config::load(&args(Some(path.clone())))
+                .unwrap()
+                .cache
+                .enabled
+        );
+
+        std::env::set_var("HDFS_S3_CACHE_ENABLED", "0");
+        assert!(
+            !Config::load(&args(Some(path.clone())))
+                .unwrap()
+                .cache
+                .enabled,
+            "env must override the config file"
+        );
+
+        let mut with_cache = args(Some(path.clone()));
+        with_cache.cache = true;
+        assert!(
+            Config::load(&with_cache).unwrap().cache.enabled,
+            "--cache must override the env"
+        );
+
+        std::env::remove_var("HDFS_S3_CACHE_ENABLED");
+        let mut no_cache = args(Some(path.clone()));
+        no_cache.no_cache = true;
+        assert!(
+            !Config::load(&no_cache).unwrap().cache.enabled,
+            "--no-cache must override an enabled config file"
+        );
+
+        std::env::set_var("HDFS_S3_CACHE_ENABLED", "definitely-not-a-bool");
+        assert!(
+            Config::load(&args(Some(path.clone()))).is_err(),
+            "a mistyped kill switch must fail fast, not keep caches enabled"
+        );
+        std::env::remove_var("HDFS_S3_CACHE_ENABLED");
+        let _ = std::fs::remove_file(path);
+    }
 }

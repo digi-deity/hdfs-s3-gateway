@@ -32,6 +32,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the shared HDFS client + gateway (shared with the Python bindings via
     // `HdfsGateway::from_config`).
+    if config.cache.enabled {
+        info!(
+            metadata_ttl_ms = config.cache.metadata_ttl_ms,
+            blocks_ttl_ms = config.cache.blocks_ttl_ms,
+            listing_ttl_ms = config.cache.listing_ttl_ms,
+            "caches enabled (external writes may be invisible until the TTL expires; \
+             disable with [cache] enabled=false, HDFS_S3_CACHE_ENABLED=0 or --no-cache)"
+        );
+    } else {
+        info!("caches disabled: every request re-reads HDFS");
+    }
+
     let gateway = HdfsGateway::from_config(&config)?;
     info!(namenode = %config.namenode_uri, "connected to HDFS NameNode");
 
