@@ -1,14 +1,14 @@
-//! Per-gateway caches: HDFS file metadata, block maps and directory listings.
+//! Per-gateway caches: HDFS file metadata, block maps and directory listings, plus the
+//! negative (known-missing) lookup cache.
 //!
-//! All three are bounded TTL caches (see [`crate::core::TtlCache`]); this module only
+//! All of them are bounded TTL caches (see [`crate::core::TtlCache`]); this module only
 //! defines their keys/values and the freshness rules. The gateway is read-only, so a
 //! cached value can only go stale because an external writer changed HDFS; the TTLs in
 //! `[cache]` bound that window, and nothing here tries to track writers.
 
 use std::num::NonZeroUsize;
-use std::time::Duration;
-
 use std::sync::Arc;
+use std::time::Duration;
 
 use hdfs_native::file::FileReader;
 
