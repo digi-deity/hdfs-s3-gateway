@@ -12,6 +12,7 @@
 //! million-entry directory listing would evict everything else and still blow the budget,
 //! so those are streamed and forgotten (also makes the cache resistant to scans).
 
+use std::borrow::Borrow;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
@@ -59,7 +60,11 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
 
     /// Fetch a live entry. Expired entries are dropped on access; a hit refreshes the
     /// entry's LRU position.
-    pub fn get(&self, key: &K) -> Option<V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         if !self.is_enabled() {
             return None;
         }
@@ -106,7 +111,11 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
     }
 
     /// Drop an entry (used when an upstream read reveals a cached value is stale/bad).
-    pub fn remove(&self, key: &K) {
+    pub fn remove<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut inner = self.lock();
         if let Some(entry) = inner.entries.pop(key) {
             inner.weight -= entry.weight;

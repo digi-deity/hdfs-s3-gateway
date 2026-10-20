@@ -177,6 +177,7 @@ fn attach_error_request_id(request_id: &str, mut err: S3Error) -> S3Error {
 }
 
 mod auth;
+mod cache;
 pub use auth::SharedSecretAuth;
 mod error;
 pub use error::map_hdfs_error;
@@ -252,15 +253,18 @@ pub struct HdfsGateway {
     client: Arc<Client>,
     mapper: PathMapper,
     config: Arc<Config>,
+    cache: Arc<cache::Caches>,
 }
 
 impl HdfsGateway {
     pub fn new(client: Client, config: Config) -> Self {
         let mapper = PathMapper::new(&config);
+        let cache = Arc::new(cache::Caches::new(&config.cache));
         HdfsGateway {
             client: Arc::new(client),
             mapper,
             config: Arc::new(config),
+            cache,
         }
     }
 
@@ -290,6 +294,43 @@ impl HdfsGateway {
     /// Python bindings) can report the bound address after `serve`.
     pub fn listen_addr(&self) -> &str {
         &self.config.listen_addr
+    }
+
+    /// Resolve an object's HDFS metadata (length, mtime, isdir), through the bounded TTL
+    /// cache unless caching is disabled.
+    ///
+    /// A missing path is remembered for the (short) negative TTL: clients probe for
+    /// `_SUCCESS`/`_common_metadata` on every scan, and each probe is otherwise a
+    /// NameNode round trip.
+    async fn file_meta(&self, hdfs_path: &str, log: &RequestLog) -> S3Result<cache::FileMeta> {
+        if let Some(meta) = self.cache.metadata.get(hdfs_path) {
+            return Ok(meta);
+        }
+        if self.cache.negative.get(hdfs_path).is_some() {
+            return Err(log.attach(s3_error!(NoSuchKey)));
+        }
+
+        match self
+            .client
+            .get_file_info(hdfs_path)
+            .instrument(log.span.clone())
+            .await
+        {
+            Ok(status) => {
+                let meta = cache::FileMeta {
+                    length: status.length as u64,
+                    isdir: status.isdir,
+                    modification_time: status.modification_time,
+                };
+                self.cache.metadata.insert(hdfs_path.to_string(), meta, 1);
+                Ok(meta)
+            }
+            Err(hdfs_native::HdfsError::FileNotFound(_)) => {
+                self.cache.negative.insert(hdfs_path.to_string(), (), 1);
+                Err(log.attach(s3_error!(NoSuchKey)))
+            }
+            Err(e) => Err(log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))),
+        }
     }
 }
 
@@ -329,12 +370,7 @@ impl S3 for HdfsGateway {
             .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
         log.set_path(&hdfs_path);
 
-        let status = self
-            .client
-            .get_file_info(&hdfs_path)
-            .instrument(log.span.clone())
-            .await
-            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+        let status = self.file_meta(&hdfs_path, &log).await?;
 
         // Directories are never surfaced as objects.
         if status.isdir {
@@ -342,8 +378,8 @@ impl S3 for HdfsGateway {
         }
 
         let meta = ObjectMetadata::from_hdfs(
-            status.path,
-            status.length as u64,
+            hdfs_path.clone(),
+            status.length,
             status.isdir,
             status.modification_time,
             None, // hdfs-native does not expose getFileChecksum (not supported upstream)
@@ -671,23 +707,18 @@ impl S3 for HdfsGateway {
             .ok_or_else(|| log.attach(s3_error!(NoSuchKey)))?;
         log.set_path(&hdfs_path);
 
-        let status = self
-            .client
-            .get_file_info(&hdfs_path)
-            .instrument(log.span.clone())
-            .await
-            .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?;
+        let status = self.file_meta(&hdfs_path, &log).await?;
 
         // Directories are never surfaced as objects.
         if status.isdir {
             return Err(log.attach(s3_error!(NoSuchKey)));
         }
 
-        let file_len = status.length as u64;
+        let file_len = status.length;
         let last_modified = millis_to_timestamp(status.modification_time);
 
         let meta = ObjectMetadata::from_hdfs(
-            status.path,
+            hdfs_path.clone(),
             file_len,
             status.isdir,
             status.modification_time,
