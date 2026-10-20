@@ -321,7 +321,7 @@ export PATH=$PATH:$HADOOP_HOME/bin
 # Start a MiniDFSCluster once (in the background), then point the tests at it.
 cargo test --lib --no-run
 HARNESS=$(ls -d target/debug/build/hdfs-native-*/out/minidfs | head -1)
-mvn -q compile exec:java -f "$HARNESS/pom.xml" > /tmp/minidfs.log 2>&1 &
+mvn -q compile exec:java -Dexec.mainClass=main.Main -f "$HARNESS/pom.xml" > /tmp/minidfs.log 2>&1 &
 # wait for the "Ready!" line in /tmp/minidfs.log, then:
 export HDFS_NAMENODE_URI=hdfs://127.0.0.1:9000
 

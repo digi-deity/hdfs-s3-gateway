@@ -82,7 +82,7 @@ jobs:
           sleep 100000 > /tmp/minidfs_stdin &
           echo $! > /tmp/minidfs_stdin_holder.pid
 
-          mvn -q compile exec:java -f "$HARNESS/pom.xml" < /tmp/minidfs_stdin > /tmp/minidfs.log 2>&1 &
+          mvn -q compile exec:java -Dexec.mainClass=main.Main -f "$HARNESS/pom.xml" < /tmp/minidfs_stdin > /tmp/minidfs.log 2>&1 &
           echo $! > /tmp/minidfs.pid
 
           for i in $(seq 1 90); do
