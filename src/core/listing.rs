@@ -442,6 +442,169 @@ mod tests {
         );
     }
 
+    /// Deterministic adversarial namespace: names deliberately use bytes that sort
+    /// immediately around the delimiter (`!`, `.`, `/`, `0`, space, UTF-8), so any
+    /// algorithm that assumes "the collapsed CommonPrefix of a directory sorts next to
+    /// the directory's own key" or "a key <= marker implies its children are too" fails
+    /// here — e.g. directory `a/b` (CommonPrefix `a/b/`) next to file `a/b.txt`
+    /// (`.` 0x2E < `/` 0x2F), or file `a/b!x` between them.
+    fn adversarial_namespace(seed: u64, n: usize) -> (Vec<ListEntry>, Vec<String>) {
+        let alphabet = ["!", ".", "0", "a", "b", "e", "_", "~", " "];
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut rnd = |m: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % m
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        while keys.len() < n {
+            let segments = 1 + rnd(3);
+            let mut key = String::new();
+            for i in 0..segments {
+                if i > 0 {
+                    key.push('/');
+                }
+                let len = 1 + rnd(3);
+                for _ in 0..len {
+                    key.push_str(alphabet[rnd(alphabet.len())]);
+                }
+            }
+            // HDFS forbids "." and ".." as path components (and `hdfs_path_to_key`
+            // would normalize them away, collapsing two distinct fake entries).
+            if key.split('/').any(|s| s == "." || s == "..") {
+                continue;
+            }
+            keys.insert(key);
+        }
+        // A real namespace cannot contain both file `k` and a directory `k`: drop
+        // candidate keys that are extended by another key at a `/` boundary.
+        let key_list: Vec<String> = keys.iter().cloned().collect();
+        let is_dir_key: std::collections::HashSet<&str> = key_list
+            .iter()
+            .filter(|k| {
+                key_list.iter().any(|other| {
+                    other.len() > k.len()
+                        && other.starts_with(k.as_str())
+                        && other.as_bytes()[k.len()] == b'/'
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        keys.retain(|k| !is_dir_key.contains(k.as_str()));
+
+        let files: Vec<ListEntry> = keys.iter().map(|k| entry(k)).collect();
+        let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in &keys {
+            let mut parts: Vec<&str> = key.split('/').collect();
+            while parts.len() > 1 {
+                parts.pop();
+                dirs.insert(parts.join("/"));
+            }
+        }
+        // A couple of empty directories: they must surface as CommonPrefixes.
+        dirs.insert(format!("{}/empty", keys.iter().next().unwrap()));
+        (files, dirs.into_iter().collect())
+    }
+
+    /// The keys of one page in output order: Contents and CommonPrefixes are each
+    /// sorted, so merging them by key recovers the page's global order.
+    fn page_keys(page: &Page) -> Vec<String> {
+        let mut keys: Vec<String> = page
+            .contents
+            .iter()
+            .map(|e| e.key.clone())
+            .chain(page.common_prefixes.iter().cloned())
+            .collect();
+        keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        keys
+    }
+
+    /// Walk every page the way a client paginator does, asserting the S3 guarantees
+    /// that do not depend on concurrent writers: strictly increasing keys, each key
+    /// exactly once, a token on every truncated page, and termination.
+    fn walk_all_pages(
+        files: &[ListEntry],
+        dirs: &[String],
+        prefix: &str,
+        delimiter: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut marker = start_after.map(str::to_string);
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= files.len() + dirs.len() + 2,
+                "pagination must terminate (prefix={prefix:?} delimiter={delimiter:?} max_keys={max_keys} start={start_after:?})"
+            );
+            let page = paginate(files, dirs, prefix, delimiter, marker.as_deref(), max_keys);
+            let keys = page_keys(&page);
+            if page.is_truncated {
+                assert!(
+                    page.next_token.is_some(),
+                    "a truncated page must carry a continuation token"
+                );
+                assert!(!keys.is_empty(), "a truncated page must not be empty");
+            }
+            for key in &keys {
+                if let Some(prev) = out.last() {
+                    assert!(
+                        prev.as_str() < key.as_str(),
+                        "keys must be strictly increasing: {prev:?} then {key:?}"
+                    );
+                }
+                out.push(key.clone());
+            }
+            match page.next_token {
+                Some(token) => marker = Some(token),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn paginate_page_size_invariance() {
+        // The whole listing must be identical whether it is served in one page or
+        // walked with any page size, from any start_after marker. This is the safety
+        // net for any "resume by binary search" optimisation: a page boundary must
+        // never skip or duplicate a key that the single-page listing contains.
+        let (files, dirs) = adversarial_namespace(7, 120);
+        for prefix in ["", "a", "a/", "a.b", "!", "\u{e9}"] {
+            for delimiter in [Some("/"), Some(".")] {
+                let full = page_keys(&paginate(
+                    &files,
+                    &dirs,
+                    prefix,
+                    delimiter,
+                    None,
+                    usize::MAX,
+                ));
+                for max_keys in [1, 2, 3, 5, 7] {
+                    let walked = walk_all_pages(&files, &dirs, prefix, delimiter, None, max_keys);
+                    assert_eq!(
+                        walked, full,
+                        "prefix={prefix:?} delimiter={delimiter:?} max_keys={max_keys}"
+                    );
+                }
+                // Resuming from an arbitrary client-supplied start_after must yield
+                // exactly the suffix of the full listing that sorts after it.
+                for marker in ["a", "a/", "a/b", "a/b.", "a/0", "!"] {
+                    let expected: Vec<String> = full
+                        .iter()
+                        .filter(|k| k.as_str() > marker)
+                        .cloned()
+                        .collect();
+                    let walked = walk_all_pages(&files, &dirs, prefix, delimiter, Some(marker), 2);
+                    assert_eq!(walked, expected, "prefix={prefix:?} marker={marker:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn paginate_max_keys_zero_is_not_truncated() {
         // max-keys=0 asks for no keys: an empty page that is NOT truncated (S3's

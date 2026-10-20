@@ -422,6 +422,10 @@ mod tests {
         }
     }
 
+    fn dir_(path: &str) -> FileStatus {
+        dir(path)
+    }
+
     fn dir(path: &str) -> FileStatus {
         FileStatus {
             isdir: true,
@@ -446,12 +450,19 @@ mod tests {
     }
 
     fn new_listing(fs: Arc<FakeFs>, prefix: &str, after: Option<String>) -> SortedListing {
+        // Mirror the production entry point: the walk starts at the prefix's directory
+        // (`PathMapper::list_start`), never at the root — a prefix like "a/" is served by
+        // listing /data/a directly, not by listing /data and filtering its children.
+        let mapper = mapper();
+        let start = mapper
+            .list_start(prefix)
+            .unwrap_or_else(|| "/data".to_string());
         SortedListing::new(
             Arc::new(FakeLister(fs)),
-            "/data".into(),
+            start,
             prefix.into(),
             after,
-            mapper(),
+            mapper,
         )
     }
 
@@ -664,6 +675,179 @@ mod tests {
             &["/data".to_string()],
             "only the root may be listed"
         );
+    }
+
+    /// Deterministic adversarial tree: names use bytes around '/' in UTF-8 order
+    /// (`.`, `!`, space, `0`), so directories are string-prefixes of sibling files
+    /// (`a/b` next to `a/b.txt`) and files sit between a directory key and the keys of
+    /// its children (`a/b!x`). Returns the tree and its sorted flat listing.
+    fn adversarial_fs(seed: u64, n: usize) -> (Arc<FakeFs>, Vec<String>) {
+        let alphabet = ["!", ".", "0", "a", "b", "e", "_", "~", " "];
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut rnd = |m: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as usize) % m
+        };
+        let mut keys = std::collections::BTreeSet::new();
+        while keys.len() < n {
+            let segments = 1 + rnd(3);
+            let mut key = String::new();
+            for i in 0..segments {
+                if i > 0 {
+                    key.push('/');
+                }
+                for _ in 0..=rnd(2) {
+                    key.push_str(alphabet[rnd(alphabet.len())]);
+                }
+            }
+            // HDFS forbids "." and ".." as path components (and `hdfs_path_to_key`
+            // would normalize them away, collapsing two distinct fake entries).
+            if key.split('/').any(|s| s == "." || s == "..") {
+                continue;
+            }
+            keys.insert(key);
+        }
+
+        // A real namespace cannot contain both file `k` and a directory `k`: drop
+        // candidate keys that are extended by another key at a `/` boundary.
+        let key_list: Vec<String> = keys.iter().cloned().collect();
+        let is_dir_key: std::collections::HashSet<&str> = key_list
+            .iter()
+            .filter(|k| {
+                key_list.iter().any(|other| {
+                    other.len() > k.len()
+                        && other.starts_with(k.as_str())
+                        && other.as_bytes()[k.len()] == b'/'
+                })
+            })
+            .map(String::as_str)
+            .collect();
+        keys.retain(|k| !is_dir_key.contains(k.as_str()));
+
+        let mut children: HashMap<String, Vec<FileStatus>> = HashMap::new();
+        let mut seen_dirs: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for key in &keys {
+            let path = format!("/data/{key}");
+            let (parent, _) = path.rsplit_once('/').unwrap();
+            children
+                .entry(parent.to_string())
+                .or_default()
+                .push(file(&path));
+            // Register every ancestor directory with its own parent.
+            let mut dir = parent.to_string();
+            while dir != "/data" {
+                let (up, _) = dir.rsplit_once('/').unwrap();
+                if seen_dirs.insert((up.to_string(), dir.clone())) {
+                    children.entry(up.to_string()).or_default().push(dir_(&dir));
+                }
+                dir = up.to_string();
+            }
+        }
+        // An empty directory: contributes no keys but must be openable.
+        children
+            .entry("/data".into())
+            .or_default()
+            .push(dir_("/data/emptydir"));
+
+        let full = keys.into_iter().collect::<Vec<String>>();
+        (
+            Arc::new(FakeFs {
+                children,
+                ..Default::default()
+            }),
+            full,
+        )
+    }
+
+    /// Walk the flat listing with a client-style paginator, asserting strict ordering,
+    /// no duplicates, a token on every truncated page, and termination.
+    async fn walk_flat(
+        fs: Arc<FakeFs>,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Vec<String> {
+        let mut collected: Vec<String> = Vec::new();
+        let mut marker = start_after.map(str::to_string);
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            assert!(pages <= 10_000, "pagination must terminate");
+            let mut listing = new_listing(fs.clone(), prefix, marker.clone());
+            let (page, truncated) = listing.collect_page(max_keys).await.unwrap();
+            let page_keys = keys(&page);
+            if truncated {
+                assert!(!page_keys.is_empty(), "a truncated page must not be empty");
+                marker = page_keys.last().cloned();
+                assert!(marker.is_some(), "a truncated page must carry a token");
+            } else {
+                marker = None;
+            }
+            for key in page_keys {
+                if let Some(prev) = collected.last() {
+                    assert!(
+                        prev.as_str() < key.as_str(),
+                        "keys must be strictly increasing (prefix={prefix:?} max_keys={max_keys} start={start_after:?}): {prev:?} then {key:?}"
+                    );
+                }
+                collected.push(key);
+            }
+            if marker.is_none() {
+                break;
+            }
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn flat_listing_page_size_invariance() {
+        // Served in one page or walked with any page size, from any marker, the flat
+        // listing must be identical: no key skipped at a page boundary, none twice,
+        // strictly ascending throughout. This is the safety net for resume-by-binary-
+        // search: a directory whose own key sorts before the marker can still have
+        // children after it (`a/b` vs marker `a/b.txt`), and files with bytes before
+        // '/' (`a/b!x`) sit between them.
+        let (fs, full) = adversarial_fs(11, 120);
+        for prefix in ["", "a", "a/", "a.b", "!"] {
+            let expected: Vec<String> = full
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect();
+            // One page is the reference.
+            let one = walk_flat(fs.clone(), prefix, None, usize::MAX).await;
+            assert_eq!(one, expected, "prefix={prefix:?} (single page)");
+            for max_keys in [1, 2, 3, 5, 7] {
+                let walked = walk_flat(fs.clone(), prefix, None, max_keys).await;
+                assert_eq!(walked, expected, "prefix={prefix:?} max_keys={max_keys}");
+            }
+            // Resuming from an arbitrary client marker yields the exact suffix.
+            let markers: Vec<Option<String>> = vec![
+                None,
+                Some("a".to_string()),
+                Some("a/".to_string()),
+                Some("a/b".to_string()),
+                Some("a/b.".to_string()),
+                Some("a/b!".to_string()),
+                Some("a/0".to_string()),
+                Some("!".to_string()),
+            ];
+            for marker in markers {
+                let expected_suffix: Vec<String> = expected
+                    .iter()
+                    .filter(|k| marker.as_deref().map_or(true, |m| k.as_str() > m))
+                    .cloned()
+                    .collect();
+                let walked = walk_flat(fs.clone(), prefix, marker.as_deref(), 2).await;
+                assert_eq!(
+                    walked, expected_suffix,
+                    "prefix={prefix:?} marker={marker:?}"
+                );
+            }
+        }
     }
 
     #[test]
