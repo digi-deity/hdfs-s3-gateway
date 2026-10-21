@@ -889,22 +889,20 @@ async fn get_object_full_and_ranged() {
 }
 
 #[tokio::test]
-async fn get_object_crosses_read_windows_exactly() {
-    // The GET body is read in bounded windows (see `range_stream`): hdfs-native builds
-    // one block stream per intersecting block eagerly, so a whole multi-TB object must
-    // not be handed to it in one call. A file larger than the window proves window
-    // rollover preserves every byte, including a range that starts and ends inside
-    // different windows.
-    const WINDOW: usize = 8 * 1024 * 1024;
+async fn get_object_streams_large_body_exactly() {
+    // A body spanning many DataNode packets must arrive byte-for-byte: `bytes_stream`
+    // enforces the declared content length, so an upstream stream that ends early fails
+    // instead of returning a silently-short "successful" response. Ranged reads of the
+    // same object must slice exactly the same bytes.
     let (_scope, gateway, _client) = setup().await;
-    let len = 2 * WINDOW + 12_345;
+    let len = 5 * 1024 * 1024 + 12_345;
     let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-    _scope.write_file("data/windows.bin", &data).await;
+    _scope.write_file("data/large.bin", &data).await;
 
     let resp = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
-            key: "data/windows.bin".into(),
+            key: "data/large.bin".into(),
             ..Default::default()
         }))
         .await
@@ -912,13 +910,13 @@ async fn get_object_crosses_read_windows_exactly() {
     assert_eq!(resp.output.content_length, Some(len as i64));
     assert_eq!(collect_body(resp.output.body.unwrap()).await, data);
 
-    // A range spanning a window boundary (and ending inside the next window).
-    let first = WINDOW - 1024;
-    let last = WINDOW + 4096;
+    // A range that starts and ends mid-object, at arbitrary offsets.
+    let first = 1024 * 1024 - 1024;
+    let last = 2 * 1024 * 1024 + 4096;
     let resp = gateway
         .get_object(req(GetObjectInput {
             bucket: "hdfs".into(),
-            key: "data/windows.bin".into(),
+            key: "data/large.bin".into(),
             range: Some(Range::Int {
                 first: first as u64,
                 last: Some(last as u64),
