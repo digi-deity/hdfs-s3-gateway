@@ -247,115 +247,6 @@ fn bytes_stream(
     )
 }
 
-/// Read a GET window in bounded chunks instead of handing the whole window to
-/// `FileReader::read_range_stream` at once.
-///
-/// hdfs-native constructs one block stream (and its packet channel) for EVERY block
-/// intersecting the requested range *eagerly*, before any data is returned. Asking it
-/// for a whole multi-TB object would therefore allocate a stream per block for every
-/// concurrent GET, which can be hundreds of MiB across connections. Reading in bounded
-/// windows keeps per-request memory proportional to the window size (a few block
-/// streams), while still amortizing the DataNode `ReadBlock` setup over megabytes —
-/// 64 KiB reads cost one DataNode op each (~8 MB/s), this costs one per window.
-const READ_WINDOW_BYTES: usize = 8 * 1024 * 1024;
-
-/// State for [`range_stream`]: the next window to request plus the stream currently
-/// being drained. `next_offset` always points at the first byte after the open window.
-struct ReadWindows {
-    reader: Arc<hdfs_native::file::FileReader>,
-    end: usize,
-    next_offset: usize,
-    window_remaining: usize,
-    current: Option<futures::stream::BoxStream<'static, Result<Bytes, hdfs_native::HdfsError>>>,
-}
-
-impl ReadWindows {
-    fn new(reader: Arc<hdfs_native::file::FileReader>, start: usize, len: usize) -> Self {
-        ReadWindows {
-            reader,
-            end: start + len,
-            next_offset: start,
-            window_remaining: 0,
-            current: None,
-        }
-    }
-
-    /// Open the next bounded window. The caller guarantees `next_offset < end`, and the
-    /// whole GET window was already checked against `reader.file_length()`, so the
-    /// upstream range is in bounds.
-    fn open_window(&mut self) {
-        let len = (self.end - self.next_offset).min(READ_WINDOW_BYTES);
-        let reader = Arc::clone(&self.reader);
-        self.current = Some(reader.read_range_stream(self.next_offset, len).boxed());
-        self.next_offset += len;
-        self.window_remaining = len;
-    }
-}
-
-/// Stream exactly `len` bytes from `start`, reading at most [`READ_WINDOW_BYTES`] from
-/// hdfs-native at a time. A window that ends early (without an upstream error) is
-/// reported as `UnexpectedEof` rather than silently skipping to the next window.
-fn range_stream(
-    reader: Arc<hdfs_native::file::FileReader>,
-    start: usize,
-    len: usize,
-) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    futures::stream::unfold(
-        ReadWindows::new(reader, start, len),
-        |mut windows| async move {
-            loop {
-                if windows.current.is_none() {
-                    if windows.next_offset >= windows.end {
-                        return None;
-                    }
-                    windows.open_window();
-                }
-
-                let next = {
-                    let stream = windows.current.as_mut().expect("a window was just opened");
-                    stream.next().await
-                };
-
-                match next {
-                    Some(Ok(mut bytes)) => {
-                        // Defensive: hdfs-native should never return more than requested.
-                        if bytes.len() > windows.window_remaining {
-                            bytes.truncate(windows.window_remaining);
-                        }
-                        windows.window_remaining -= bytes.len();
-                        return Some((Ok(bytes), windows));
-                    }
-                    Some(Err(e)) => {
-                        // Stop after the first error; the next poll returns None. The S3
-                        // layer evicts the cached block map when it sees this error.
-                        windows.current = None;
-                        windows.next_offset = windows.end;
-                        windows.window_remaining = 0;
-                        return Some((Err(std::io::Error::other(e)), windows));
-                    }
-                    None => {
-                        if windows.window_remaining > 0 {
-                            let missing = windows.window_remaining;
-                            windows.current = None;
-                            windows.next_offset = windows.end;
-                            windows.window_remaining = 0;
-                            let error = std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                format!(
-                                    "HDFS range stream ended {missing} bytes before the end of its read window"
-                                ),
-                            );
-                            return Some((Err(error), windows));
-                        }
-                        // Window complete; loop to open the next one (or finish).
-                        windows.current = None;
-                    }
-                }
-            }
-        },
-    )
-}
-
 /// The gateway: holds a shared HDFS client and the path mapper.
 #[derive(Clone)]
 pub struct HdfsGateway {
@@ -968,8 +859,19 @@ impl S3 for HdfsGateway {
 
         // --- Streaming body (never buffer the whole object) -------------
         let reader = self.open_reader(&hdfs_path, &status, &log).await?;
-        // Read in bounded windows (not one ReadBlock per 64 KiB buffer, and not one
-        // eagerly-built stream per block of a multi-TB object). See `range_stream`.
+        // One HDFS read for the whole request window. Reading via AsyncRead (ReaderStream)
+        // would start a new DataNode ReadBlock op per 64 KiB buffer (~8 ms each), capping a
+        // GET at ~8 MB/s.
+        //
+        // `read_range_stream` eagerly builds one block stream per INTERSECTING block, so a
+        // single call costs ~3 KiB per block of the requested window (~25 MB for a
+        // full-object GET of a 1 TiB file at 128 MiB blocks). That is accepted: at those
+        // sizes the block map is already cached in full (~1.3 KiB/block, see
+        // `open_reader`), the target workloads are GB-scale (10 GB is ~80 blocks, i.e.
+        // ~0.25 MB), and splitting the read into smaller windows instead costs one extra
+        // DataNode ReadBlock op and one stop-and-wait RTT bubble per window boundary.
+        // If multi-TiB objects ever become a target, bound the window here — do not shrink
+        // the per-read buffers, which is a 128x larger pipelining hit.
         if window_end > reader.file_length() {
             // File shrank since the metadata was read; read_range_stream would panic.
             // Both caches are stale: drop the block map (so the next request re-opens
@@ -982,7 +884,8 @@ impl S3 for HdfsGateway {
         let remaining = window_end - window_start;
         let cache = Arc::clone(&self.cache);
         let cached_path = hdfs_path.clone();
-        let stream = range_stream(reader, window_start, remaining)
+        let stream = reader
+            .read_range_stream(window_start, remaining)
             .map(move |r| {
                 if r.is_err() {
                     // Stale block locations (or a DataNode failure): stop reusing this
@@ -992,7 +895,7 @@ impl S3 for HdfsGateway {
                     cache.blocks.remove(&cached_path);
                     cache.metadata.remove(&cached_path);
                 }
-                r
+                r.map_err(std::io::Error::other)
             })
             .boxed();
         // `hdfs-native`'s range stream is `Send` but not `Sync` (it is built on
