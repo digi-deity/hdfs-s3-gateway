@@ -225,9 +225,11 @@ def _run(code: str):
 # --------------------------------------------------------------------------- #
 
 
-def test_cache_enabled_kwarg_and_default():
+def test_cache_enabled_kwarg_and_default(monkeypatch):
     # Caches are opt-in: the default is disabled, and the constructor argument is the
     # highest-precedence switch (the incident lever, no release needed to flip it).
+    # Clear the env override so this test is independent of the developer/CI environment.
+    monkeypatch.delenv("HDFS_S3_CACHE_ENABLED", raising=False)
     assert gateway(listen_addr=LISTEN, **KW).cache_enabled is False
     assert (
         gateway(listen_addr=LISTEN, cache_enabled=True, **KW).cache_enabled is True

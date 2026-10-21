@@ -55,7 +55,7 @@ toml = "0.8"
 
 # Misc
 async-trait = "0.1"
-# Bounded, weighted LRU used by the bounded TTL caches (metadata, block maps, listings).
+# Bounded, weighted LRU used by the TTL caches (metadata, blocks, listings, negative).
 lru = "0.12"
 bytes = "1"
 mime_guess = "2"

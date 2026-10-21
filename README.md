@@ -68,7 +68,7 @@ fast at startup.
 | `hdfs_config_dir` | — | — | `None` | Optional → `with_config_dir`; **replaces** `HADOOP_CONF_DIR`/`HADOOP_HOME` fallback when set |
 | `hdfs_user` | — | — | `None` | Optional → `with_user`; else `HADOOP_USER_NAME`/`HADOOP_PROXY_USER` |
 | `auth_secret` | `AUTH_SECRET` | `--auth-secret` | `None` | Optional shared secret. When **unset** (default), the gateway accepts **both** anonymous and any signed request. When **set**, a valid SigV4 signature is **required** (unsigned → `403`, wrong secret → `403 SignatureDoesNotMatch`). Not user identity — a shared password. |
-| `[cache] enabled` | `HDFS_S3_CACHE_ENABLED` | `--cache` / `--no-cache` | `false` | Opt-in metadata/block-map/listing caches. `--no-cache` is the highest-precedence incident kill switch (see [caching](#caching--consistency)). |
+| `[cache] enabled` | `HDFS_S3_CACHE_ENABLED` | `--cache` / `--no-cache` | `false` | Opt-in metadata/block-map/listing/negative caches. `--no-cache` is the highest-precedence incident kill switch (see [caching](#caching--consistency)). |
 
 Example `config.toml`:
 
@@ -87,8 +87,9 @@ hdfs_options = { "dfs.client.use.datanode.hostname" = "true" }
 [cache]
 enabled = true            # or HDFS_S3_CACHE_ENABLED=1 / --cache
 metadata_ttl_ms = 1000    # getFileInfo results (GET + HEAD)
-blocks_ttl_ms = 10000     # block maps, revalidated on (length, mtime) every GET
+blocks_ttl_ms = 10000     # block maps, revalidated whenever metadata is re-read
 listing_ttl_ms = 5000     # non-recursive directory listings
+negative_ttl_ms = 1000    # known-missing paths (_SUCCESS probes)
 ```
 
 > **Turning the caches off again (no release needed):** set `[cache] enabled = false`,
@@ -369,9 +370,9 @@ Test layout:
 ## Caching & consistency
 
 The gateway is **read-only**: the only writes it can observe come from clients *outside*
-it, and the NameNode offers no change-notification channel. It therefore ships with three
+it, and the NameNode offers no change-notification channel. It therefore ships with four
 optional, bounded TTL caches, all **off by default** (`[cache] enabled = true` turns them
-on; each has its own TTL and budget):
+on; each has its own TTL and capacity — the negative cache shares the metadata capacity):
 
 | cache | what it removes from the hot path | default TTL |
 |---|---|---|
@@ -385,11 +386,13 @@ file stat), and a single listing larger than `listing_max_dir_entries` is served
 cached, so one huge directory scan cannot flush everything else.
 
 **The trade-off, stated plainly:** within the TTL, an object or directory changed by an
-external writer may not be visible yet; a GET may serve the previous bytes (ETag,
-Last-Modified and listing entries all come from the same cached metadata, so they stay
-internally consistent with each other). After the TTL the next request re-reads HDFS.
-That is the right trade for read-heavy analytics/parquet workloads, and the wrong one if
-your clients expect immediate external-write visibility — which is why it is opt-in.
+external writer may not be visible yet; a GET may serve the previous bytes, and a newly
+created key may still be reported missing by the negative cache. HEAD/GET derive their
+ETag and Last-Modified from the same cached metadata, so those stay consistent with each
+other; list entries come from the directory-listing cache, whose TTL is independent.
+After the TTL the next request re-reads HDFS. That is the right trade for read-heavy
+analytics/parquet workloads, and the wrong one if your clients expect immediate
+external-write visibility — which is why it is opt-in.
 
 **Incident kill switch.** If a cache is ever suspected of a bug, disable it without a new
 release, in increasing order of intrusiveness:

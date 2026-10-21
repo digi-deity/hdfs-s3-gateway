@@ -965,9 +965,12 @@ mod tests {
                 Some("a".to_string()),
                 Some("a/".to_string()),
                 Some("a/b".to_string()),
+                Some("a/b/".to_string()),
                 Some("a/b.".to_string()),
                 Some("a/b!".to_string()),
+                Some("a/b!/".to_string()),
                 Some("a/0".to_string()),
+                Some("a/0/".to_string()),
                 Some("!".to_string()),
             ];
             for marker in markers {

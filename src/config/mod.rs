@@ -39,8 +39,8 @@ pub struct CliArgs {
     #[arg(long)]
     pub auth_secret: Option<String>,
 
-    /// Force-disable the metadata, block-map and directory-listing caches for this
-    /// process. Incident kill switch: takes precedence over `[cache] enabled` and
+    /// Force-disable the metadata, block-map, directory-listing and negative caches for
+    /// this process. Incident kill switch: takes precedence over `[cache] enabled` and
     /// `HDFS_S3_CACHE_ENABLED`, so a suspected cache bug can be mitigated by changing
     /// only the launch arguments (no new release, no config edit).
     #[arg(long, conflicts_with = "cache")]
@@ -105,8 +105,9 @@ pub struct Config {
     #[serde(default)]
     pub hdfs_user: Option<String>,
 
-    /// Bounded TTL caches for metadata, block maps and directory listings. Defaults to
-    /// safe, short TTLs (see [`CacheConfig`]); `[cache] enabled = false` disables them.
+    /// Bounded TTL caches for metadata, block maps, directory listings and negative
+    /// lookups. Defaults to safe, short TTLs (see [`CacheConfig`]); setting `[cache]
+    /// enabled` to false disables them.
     #[serde(default)]
     pub cache: CacheConfig,
 
@@ -122,7 +123,8 @@ pub struct Config {
     pub auth_secret: Option<String>,
 }
 
-/// Bounded TTL caches for NameNode metadata, block maps and directory listings.
+/// Bounded TTL caches for NameNode metadata, block maps, directory listings and negative
+/// (known-missing) lookups.
 ///
 /// The gateway is read-only: only writers OUTSIDE the gateway can change HDFS, and there
 /// is no invalidation channel from the NameNode. Freshness is therefore bounded by these
@@ -282,8 +284,12 @@ impl Config {
             ));
         }
         // The listing cache weight budget must be able to hold at least one entry,
-        // otherwise caching listings is silently impossible.
-        if self.cache.listing_capacity_entries == 0 && self.cache.listing_ttl_ms > 0 {
+        // otherwise enabling the cache would silently do nothing. (A zero capacity is
+        // harmless while caching is disabled, e.g. left over in a shared config.)
+        if self.cache.enabled
+            && self.cache.listing_ttl_ms > 0
+            && self.cache.listing_capacity_entries == 0
+        {
             return Err(ConfigError::Invalid(
                 "cache.listing_capacity_entries must be greater than 0".into(),
             ));
