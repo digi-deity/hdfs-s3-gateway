@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metadata_ttl_ms = config.cache.metadata_ttl_ms,
             blocks_ttl_ms = config.cache.blocks_ttl_ms,
             listing_ttl_ms = config.cache.listing_ttl_ms,
+            negative_ttl_ms = config.cache.negative_ttl_ms,
             "caches enabled (external writes may be invisible until the TTL expires; \
              disable with [cache] enabled=false, HDFS_S3_CACHE_ENABLED=0 or --no-cache)"
         );

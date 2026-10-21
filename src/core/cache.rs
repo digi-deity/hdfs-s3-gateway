@@ -1,5 +1,5 @@
-//! Bounded, weighted TTL cache used by the gateway's metadata, block-map and directory
-//! listing caches.
+//! Bounded, weighted TTL cache used by the gateway's metadata, block-map, directory
+//! listing and negative (known-missing) caches.
 //!
 //! The gateway is read-only, so the only source of change is a writer *outside* the
 //! gateway (another HDFS client). There is no invalidation channel from the NameNode, so
@@ -93,14 +93,21 @@ impl<K: Hash + Eq, V: Clone> TtlCache<K, V> {
         if let Some(old) = inner.entries.pop(&key) {
             inner.weight -= old.weight;
         }
-        inner.entries.put(
+        // `push` (unlike `put`) returns the entry evicted because the cache is at its
+        // entry-count capacity, so its weight can be released here. Otherwise `weight`
+        // drifts upward on every insert at capacity, eventually making the weight budget
+        // evict live entries (or, with a large budget, growing without bound over a
+        // long-running process).
+        if let Some((_, evicted)) = inner.entries.push(
             key,
             Entry {
                 value,
                 inserted: Instant::now(),
                 weight,
             },
-        );
+        ) {
+            inner.weight -= evicted.weight;
+        }
         inner.weight += weight;
         while inner.weight > self.max_weight {
             match inner.entries.pop_lru() {
@@ -200,6 +207,29 @@ mod tests {
         assert_eq!(c.get(&"a"), None);
         assert_eq!(c.get(&"b"), None);
         assert_eq!(c.weight(), 4);
+    }
+
+    #[test]
+    fn capacity_eviction_releases_weight() {
+        // The LRU evicts on entry-count capacity, independently of our weighted
+        // eviction. The evicted entry's weight must be subtracted too, or the internal
+        // weight drifts above the entries actually held (which would eventually evict
+        // live entries and break the cache's memory-bound accounting).
+        let c = TtlCache::new(
+            NonZeroUsize::new(2).unwrap(),
+            Duration::from_millis(60_000),
+            100,
+        );
+        c.insert("a", "A", 3);
+        c.insert("b", "B", 5);
+        assert_eq!(c.weight(), 8);
+        c.insert("c", "C", 7);
+        assert_eq!(c.get(&"a"), None, "capacity must evict the LRU entry");
+        assert_eq!(c.get(&"b"), Some("B"));
+        assert_eq!(c.get(&"c"), Some("C"));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.weight(), 12, "evicted entry's weight must be released");
+        assert!(c.weight() <= 100);
     }
 
     #[test]

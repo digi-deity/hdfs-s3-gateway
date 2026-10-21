@@ -247,6 +247,115 @@ fn bytes_stream(
     )
 }
 
+/// Read a GET window in bounded chunks instead of handing the whole window to
+/// `FileReader::read_range_stream` at once.
+///
+/// hdfs-native constructs one block stream (and its packet channel) for EVERY block
+/// intersecting the requested range *eagerly*, before any data is returned. Asking it
+/// for a whole multi-TB object would therefore allocate a stream per block for every
+/// concurrent GET, which can be hundreds of MiB across connections. Reading in bounded
+/// windows keeps per-request memory proportional to the window size (a few block
+/// streams), while still amortizing the DataNode `ReadBlock` setup over megabytes —
+/// 64 KiB reads cost one DataNode op each (~8 MB/s), this costs one per window.
+const READ_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
+/// State for [`range_stream`]: the next window to request plus the stream currently
+/// being drained. `next_offset` always points at the first byte after the open window.
+struct ReadWindows {
+    reader: Arc<hdfs_native::file::FileReader>,
+    end: usize,
+    next_offset: usize,
+    window_remaining: usize,
+    current: Option<futures::stream::BoxStream<'static, Result<Bytes, hdfs_native::HdfsError>>>,
+}
+
+impl ReadWindows {
+    fn new(reader: Arc<hdfs_native::file::FileReader>, start: usize, len: usize) -> Self {
+        ReadWindows {
+            reader,
+            end: start + len,
+            next_offset: start,
+            window_remaining: 0,
+            current: None,
+        }
+    }
+
+    /// Open the next bounded window. The caller guarantees `next_offset < end`, and the
+    /// whole GET window was already checked against `reader.file_length()`, so the
+    /// upstream range is in bounds.
+    fn open_window(&mut self) {
+        let len = (self.end - self.next_offset).min(READ_WINDOW_BYTES);
+        let reader = Arc::clone(&self.reader);
+        self.current = Some(reader.read_range_stream(self.next_offset, len).boxed());
+        self.next_offset += len;
+        self.window_remaining = len;
+    }
+}
+
+/// Stream exactly `len` bytes from `start`, reading at most [`READ_WINDOW_BYTES`] from
+/// hdfs-native at a time. A window that ends early (without an upstream error) is
+/// reported as `UnexpectedEof` rather than silently skipping to the next window.
+fn range_stream(
+    reader: Arc<hdfs_native::file::FileReader>,
+    start: usize,
+    len: usize,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::unfold(
+        ReadWindows::new(reader, start, len),
+        |mut windows| async move {
+            loop {
+                if windows.current.is_none() {
+                    if windows.next_offset >= windows.end {
+                        return None;
+                    }
+                    windows.open_window();
+                }
+
+                let next = {
+                    let stream = windows.current.as_mut().expect("a window was just opened");
+                    stream.next().await
+                };
+
+                match next {
+                    Some(Ok(mut bytes)) => {
+                        // Defensive: hdfs-native should never return more than requested.
+                        if bytes.len() > windows.window_remaining {
+                            bytes.truncate(windows.window_remaining);
+                        }
+                        windows.window_remaining -= bytes.len();
+                        return Some((Ok(bytes), windows));
+                    }
+                    Some(Err(e)) => {
+                        // Stop after the first error; the next poll returns None. The S3
+                        // layer evicts the cached block map when it sees this error.
+                        windows.current = None;
+                        windows.next_offset = windows.end;
+                        windows.window_remaining = 0;
+                        return Some((Err(std::io::Error::other(e)), windows));
+                    }
+                    None => {
+                        if windows.window_remaining > 0 {
+                            let missing = windows.window_remaining;
+                            windows.current = None;
+                            windows.next_offset = windows.end;
+                            windows.window_remaining = 0;
+                            let error = std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                format!(
+                                    "HDFS range stream ended {missing} bytes before the end of its read window"
+                                ),
+                            );
+                            return Some((Err(error), windows));
+                        }
+                        // Window complete; loop to open the next one (or finish).
+                        windows.current = None;
+                    }
+                }
+            }
+        },
+    )
+}
+
 /// The gateway: holds a shared HDFS client and the path mapper.
 #[derive(Clone)]
 pub struct HdfsGateway {
@@ -340,8 +449,9 @@ impl HdfsGateway {
     /// dominant NameNode cost of a small ranged read, and parquet-style clients issue
     /// many such reads per object. Cache the `FileReader` and reuse it only while the
     /// file's freshly read identity (length, mtime) still matches: a replaced object can
-    /// never be served from the previous block map. A failed read evicts the entry so an
-    /// all-replicas-stale block map costs one failed request, not the rest of its TTL.
+    /// never be served from the previous block map. A failed open/read evicts both the
+    /// block map and the metadata, so a deleted/replaced object or an all-replicas-stale
+    /// block map costs one failed request, not the rest of its TTL.
     async fn open_reader(
         &self,
         hdfs_path: &str,
@@ -355,13 +465,21 @@ impl HdfsGateway {
             self.cache.blocks.remove(hdfs_path);
         }
 
-        let reader = Arc::new(
-            self.client
-                .read(hdfs_path)
-                .instrument(log.span.clone())
-                .await
-                .map_err(|e| log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)))?,
-        );
+        let reader = match self
+            .client
+            .read(hdfs_path)
+            .instrument(log.span.clone())
+            .await
+        {
+            Ok(reader) => Arc::new(reader),
+            Err(e) => {
+                // The path may have been replaced/deleted since the (possibly cached)
+                // metadata was read. Drop that metadata so the next request re-stats
+                // instead of repeatedly failing on the same stale entry.
+                self.cache.metadata.remove(hdfs_path);
+                return Err(log.attach(map_hdfs_error(e, self.config.expose_upstream_errors)));
+            }
+        };
         self.cache.blocks.insert(
             hdfs_path.to_string(),
             cache::CachedReader {
@@ -535,9 +653,9 @@ impl S3 for HdfsGateway {
 
         // Contents and CommonPrefixes of the requested page, in key order, plus the raw
         // last key of the page (the next continuation token) when it is truncated.
-        let (page_entries, page_prefixes, is_truncated, next_token) = if delimiter.is_some() {
-            // --- Delimiter path: ONE non-recursive listing of the prefix directory. ---
-            // With a delimiter, a listing's output is fully determined by the direct
+        let (page_entries, page_prefixes, is_truncated, next_token) = if delimiter == Some("/") {
+            // --- Canonical delimiter path: ONE non-recursive listing of the prefix dir. ---
+            // With delimiter "/", a listing's output is fully determined by the direct
             // children of the directory part of the prefix: matching files become
             // Contents, matching subdirectories collapse into CommonPrefixes. A
             // recursive walk (one `getListing` RPC per directory of the subtree) would
@@ -583,28 +701,68 @@ impl S3 for HdfsGateway {
                 },
             };
 
-            let page = if delimiter == Some("/") {
-                // Canonical delimiter: collapse is always `dir + "/"`, so each kind's
-                // key order is monotone and resumption is a binary search (O(log n)).
-                crate::core::paginate_slash(
-                    &listing.files,
-                    &listing.dirs,
-                    &prefix,
-                    start_after.as_deref(),
-                    max_keys,
-                )
+            // Canonical delimiter: collapse is always `dir + "/"`, so each kind's
+            // key order is monotone and resumption is a binary search (O(log n)).
+            let page = crate::core::paginate_slash(
+                &listing.files,
+                &listing.dirs,
+                &prefix,
+                start_after.as_deref(),
+                max_keys,
+            );
+            (
+                page.contents,
+                page.common_prefixes,
+                page.is_truncated,
+                page.next_token,
+            )
+        } else if delimiter.is_some() {
+            // --- Rare non-"/" delimiter: recurse over the bounded subtree. ---
+            // The one-directory shortcut above is only valid for "/": any other
+            // delimiter can occur arbitrarily deep in a key (`a/b.txt` with delimiter
+            // "."), so the collapse depends on every matching key in the subtree, not
+            // just the prefix directory's direct children. Use the same lazy, sorted
+            // subtree merge as the flat path, then let the general paginator compute
+            // Contents/CommonPrefixes. This path is uncommon (S3 clients overwhelmingly
+            // use "/"), so materializing its matching keys is an acceptable trade for
+            // correctness; the "/" path stays O(log n + page) per request.
+            let (entries, _) = if max_keys == 0 {
+                (Vec::new(), false)
             } else {
-                // Rare non-"/" delimiter: the collapse depends on the prefix, so keep
-                // the general (linear) paginator.
-                paginate(
-                    &listing.files,
-                    &listing.dirs,
-                    &prefix,
-                    delimiter,
-                    start_after.as_deref(),
-                    max_keys,
-                )
+                match self.mapper.list_start(&prefix) {
+                    None => (Vec::new(), false),
+                    Some(hdfs_start) => {
+                        let lister: Arc<dyn DirLister> = Arc::new(HdfsDirLister::new(
+                            self.client.clone(),
+                            self.mapper.clone(),
+                            Arc::clone(&self.cache),
+                            log.span.clone(),
+                        ));
+                        let mut listing = SortedListing::new(
+                            lister,
+                            hdfs_start,
+                            prefix.clone(),
+                            start_after.clone(),
+                            self.mapper.clone(),
+                        );
+                        // `usize::MAX` requests every remaining key, not a page: the
+                        // delimiter collapse needs the whole matching subtree. The
+                        // continuation marker is pushed down, so a later page never
+                        // re-reads keys that sort strictly before it.
+                        listing.collect_page(usize::MAX).await.map_err(|e| {
+                            log.attach(map_hdfs_error(e, self.config.expose_upstream_errors))
+                        })?
+                    }
+                }
             };
+            let page = paginate(
+                &entries,
+                &[],
+                &prefix,
+                delimiter,
+                start_after.as_deref(),
+                max_keys,
+            );
             (
                 page.contents,
                 page.common_prefixes,
@@ -810,26 +968,31 @@ impl S3 for HdfsGateway {
 
         // --- Streaming body (never buffer the whole object) -------------
         let reader = self.open_reader(&hdfs_path, &status, &log).await?;
-        // One HDFS read for the whole window. Reading via AsyncRead (ReaderStream) starts a
-        // new DataNode ReadBlock op per 64 KiB buffer (~8 ms each), capping a GET at ~8 MB/s.
+        // Read in bounded windows (not one ReadBlock per 64 KiB buffer, and not one
+        // eagerly-built stream per block of a multi-TB object). See `range_stream`.
         if window_end > reader.file_length() {
             // File shrank since the metadata was read; read_range_stream would panic.
-            // Drop the now-stale block map so the next request re-opens it.
+            // Both caches are stale: drop the block map (so the next request re-opens
+            // it) and the metadata (so the next request re-reads the new length instead
+            // of failing this check for the rest of the metadata TTL).
             self.cache.blocks.remove(&hdfs_path);
+            self.cache.metadata.remove(&hdfs_path);
             return Err(log.attach(s3_error!(InternalError)));
         }
         let remaining = window_end - window_start;
         let cache = Arc::clone(&self.cache);
         let cached_path = hdfs_path.clone();
-        let stream = reader
-            .read_range_stream(window_start, remaining)
+        let stream = range_stream(reader, window_start, remaining)
             .map(move |r| {
                 if r.is_err() {
                     // Stale block locations (or a DataNode failure): stop reusing this
-                    // block map for the rest of its TTL.
+                    // block map for the rest of its TTL. Also drop the metadata: if the
+                    // file was deleted/replaced, re-stat on the next request instead of
+                    // re-opening a doomed block map until the metadata TTL expires.
                     cache.blocks.remove(&cached_path);
+                    cache.metadata.remove(&cached_path);
                 }
-                r.map_err(std::io::Error::other)
+                r
             })
             .boxed();
         // `hdfs-native`'s range stream is `Send` but not `Sync` (it is built on

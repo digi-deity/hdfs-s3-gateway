@@ -372,6 +372,74 @@ async fn list_objects_v2_prefix_with_delimiter() {
 }
 
 #[tokio::test]
+async fn list_objects_v2_non_slash_delimiter_walks_subtree() {
+    // A non-"/" delimiter can occur arbitrarily deep in a key (`a/b.txt` with
+    // delimiter "."), so collapsing the listing needs every matching key in the
+    // subtree — not just the direct children of the prefix's directory. This is the
+    // regression guard for accidentally applying the "/" single-directory shortcut
+    // to all delimiters (which silently dropped every nested key).
+    let (_scope, gateway, _client) = setup().await;
+    _scope.write_file("data/nonslash/plain", b"p").await;
+    _scope.write_file("data/nonslash/root.txt", b"r").await;
+    _scope.write_file("data/nonslash/dir/a.txt", b"a").await;
+    _scope.write_file("data/nonslash/dir/b.txt", b"b").await;
+    _scope.write_file("data/nonslash/dir/sub/c.txt", b"c").await;
+    _scope
+        .write_file("data/nonslash/other/deep/d.txt", b"d")
+        .await;
+
+    let mut contents: Vec<String> = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 10, "non-\"/\" delimiter pagination must terminate");
+        let resp = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/nonslash/".into()),
+                delimiter: Some(".".into()),
+                max_keys: Some(2),
+                continuation_token: token.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        contents.extend(
+            resp.contents
+                .unwrap_or_default()
+                .into_iter()
+                .map(|o| o.key.unwrap()),
+        );
+        prefixes.extend(
+            resp.common_prefixes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.prefix.unwrap()),
+        );
+        match resp.next_continuation_token {
+            Some(t) => token = Some(t),
+            None => break,
+        }
+    }
+
+    assert_eq!(contents, vec!["data/nonslash/plain".to_string()]);
+    assert_eq!(
+        prefixes,
+        vec![
+            "data/nonslash/dir/a.".to_string(),
+            "data/nonslash/dir/b.".to_string(),
+            "data/nonslash/dir/sub/c.".to_string(),
+            "data/nonslash/other/deep/d.".to_string(),
+            "data/nonslash/root.".to_string(),
+        ],
+        "nested keys must collapse at the first non-\"/\" delimiter, in key order"
+    );
+}
+
+#[tokio::test]
 async fn list_objects_v2_delimiter_pagination_terminates() {
     // Regression for the infinite-pagination loop: a delimiter listing with more
     // CommonPrefixes than max-keys used to re-serve the same page forever (the
@@ -818,6 +886,51 @@ async fn get_object_full_and_ranged() {
         .await
         .unwrap_err();
     assert!(format!("{err:?}").contains("NoSuchKey"));
+}
+
+#[tokio::test]
+async fn get_object_crosses_read_windows_exactly() {
+    // The GET body is read in bounded windows (see `range_stream`): hdfs-native builds
+    // one block stream per intersecting block eagerly, so a whole multi-TB object must
+    // not be handed to it in one call. A file larger than the window proves window
+    // rollover preserves every byte, including a range that starts and ends inside
+    // different windows.
+    const WINDOW: usize = 8 * 1024 * 1024;
+    let (_scope, gateway, _client) = setup().await;
+    let len = 2 * WINDOW + 12_345;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    _scope.write_file("data/windows.bin", &data).await;
+
+    let resp = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/windows.bin".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(resp.output.content_length, Some(len as i64));
+    assert_eq!(collect_body(resp.output.body.unwrap()).await, data);
+
+    // A range spanning a window boundary (and ending inside the next window).
+    let first = WINDOW - 1024;
+    let last = WINDOW + 4096;
+    let resp = gateway
+        .get_object(req(GetObjectInput {
+            bucket: "hdfs".into(),
+            key: "data/windows.bin".into(),
+            range: Some(Range::Int {
+                first: first as u64,
+                last: Some(last as u64),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_body(resp.output.body.unwrap()).await,
+        data[first..=last]
+    );
 }
 
 #[tokio::test]
@@ -1356,6 +1469,62 @@ async fn metadata_cache_ttl_bounds_staleness() {
 }
 
 #[tokio::test]
+async fn negative_cache_ttl_bounds_missing_key_visibility() {
+    // Clients probe keys such as `_SUCCESS` and `_common_metadata` constantly, so a
+    // missing path is cached for the negative TTL. A key created by an external writer
+    // therefore stays invisible for that window, then becomes visible when the negative
+    // entry expires and the next HEAD re-stats HDFS.
+    let (scope, _gateway, client) = setup().await;
+
+    let exists = |gateway: HdfsGateway| async move {
+        match gateway
+            .head_object(req(HeadObjectInput {
+                bucket: "hdfs".into(),
+                key: "data/neg/created.txt".into(),
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                let dbg = format!("{e:?}");
+                assert!(dbg.contains("NoSuchKey"), "unexpected HEAD error: {dbg}");
+                false
+            }
+        }
+    };
+
+    let mut long = scope.config();
+    long.cache.enabled = true;
+    long.cache.negative_ttl_ms = 60_000;
+    let long = HdfsGateway::new(client.clone(), long);
+
+    let mut short = scope.config();
+    short.cache.enabled = true;
+    short.cache.negative_ttl_ms = 200;
+    let short = HdfsGateway::new(client.clone(), short);
+
+    // Prime the negative entries: the object does not exist yet.
+    assert!(!exists(long.clone()).await);
+    assert!(!exists(short.clone()).await);
+
+    scope.write_file("data/neg/created.txt", b"now here").await;
+
+    // Within the negative TTL the cached miss wins over the newly created object.
+    assert!(
+        !exists(long).await,
+        "a cached miss must hide an externally created key within its TTL"
+    );
+
+    // After the short negative TTL, HEAD re-stats HDFS and sees the object.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(
+        exists(short).await,
+        "the negative entry must expire and the created key become visible"
+    );
+}
+
+#[tokio::test]
 async fn block_cache_is_invalidated_when_the_object_changes() {
     // A cached block map is only reused while the object's (length, mtime) still match
     // the freshly read metadata. Here the metadata TTL is short and the block TTL long,
@@ -1398,17 +1567,65 @@ async fn block_cache_is_invalidated_when_the_object_changes() {
 }
 
 #[tokio::test]
+async fn shrinking_object_invalidates_cached_metadata() {
+    // If an external writer shrinks a file while its (long-TTL) metadata is cached, the
+    // first GET detects the stale length and fails rather than panicking or serving a
+    // silently short body. It must also drop that metadata: otherwise every GET keeps
+    // re-reading a block map that is shorter than the cached length and fails until the
+    // metadata TTL expires. The next GET re-stats and succeeds with the new contents.
+    let (scope, _gateway, client) = setup().await;
+    scope.write_file("data/cache/shrink.bin", b"aaaa").await;
+
+    let mut config = scope.config();
+    config.cache.enabled = true;
+    config.cache.metadata_ttl_ms = 60_000;
+    // Disable block-map reuse so the shrunken file is observed on the very next GET,
+    // making the metadata-invalidation assertion deterministic.
+    config.cache.blocks_ttl_ms = 0;
+    let gateway = HdfsGateway::new(client.clone(), config);
+
+    let get = |gateway: HdfsGateway| async move {
+        match gateway
+            .get_object(req(GetObjectInput {
+                bucket: "hdfs".into(),
+                key: "data/cache/shrink.bin".into(),
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(out) => Ok(collect_body(out.output.body.unwrap()).await),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    };
+
+    assert_eq!(get(gateway.clone()).await.unwrap(), b"aaaa");
+
+    scope.write_file("data/cache/shrink.bin", b"bb").await;
+
+    // The stale metadata said 4 bytes, but the fresh block map is 2 bytes: fail rather
+    // than panic in `read_range_stream` or return a short "successful" response.
+    let first = get(gateway.clone()).await;
+    assert!(
+        first.is_err(),
+        "a shrink within the metadata TTL must fail explicitly, got: {first:?}"
+    );
+
+    // The failure evicted the stale metadata, so the next request recovers immediately
+    // instead of repeating the same error for the rest of the TTL.
+    assert_eq!(
+        get(gateway).await.unwrap(),
+        b"bb",
+        "the next GET must re-read the shrunk file's metadata and succeed"
+    );
+}
+
+#[tokio::test]
 async fn listing_cache_ttl_bounds_staleness() {
     // Both listing strategies share one bounded-TTL directory cache. A directory listed
     // once is served from cache until its TTL expires, then re-listed: entries created
     // by an external writer become visible only after that window.
     let (scope, _gateway, client) = setup().await;
     scope.write_file("data/lcached/a.txt", b"a").await;
-
-    let mut config = scope.config();
-    config.cache.enabled = true;
-    config.cache.listing_ttl_ms = 300;
-    let gateway = HdfsGateway::new(client.clone(), config);
 
     let list = |gateway: HdfsGateway| async move {
         let out = gateway
@@ -1426,22 +1643,65 @@ async fn listing_cache_ttl_bounds_staleness() {
             .map(|o| o.key.unwrap())
             .collect::<Vec<_>>()
     };
+    // The delimiter path uses the same directory cache (it lists the same HDFS
+    // directory), so it must observe the same TTL window.
+    let list_delim = |gateway: HdfsGateway| async move {
+        let out = gateway
+            .list_objects_v2(req(ListObjectsV2Input {
+                bucket: "hdfs".into(),
+                prefix: Some("data/lcached/".into()),
+                delimiter: Some("/".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .output;
+        out.contents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| o.key.unwrap())
+            .collect::<Vec<_>>()
+    };
 
-    assert_eq!(list(gateway.clone()).await, vec!["data/lcached/a.txt"]);
+    // Two independent gateways: the long-TTL one proves a cached listing is reused
+    // (without assuming the external write itself completes within a tiny TTL), and the
+    // short-TTL one proves expiry re-reads HDFS.
+    let mut long = scope.config();
+    long.cache.enabled = true;
+    long.cache.listing_ttl_ms = 60_000;
+    let long = HdfsGateway::new(client.clone(), long);
+
+    let mut short = scope.config();
+    short.cache.enabled = true;
+    short.cache.listing_ttl_ms = 200;
+    let short = HdfsGateway::new(client.clone(), short);
+
+    assert_eq!(list(long.clone()).await, vec!["data/lcached/a.txt"]);
+    assert_eq!(list(short.clone()).await, vec!["data/lcached/a.txt"]);
 
     // External writer adds an object: invisible until the cached listing expires.
     scope.write_file("data/lcached/b.txt", b"b").await;
     assert_eq!(
-        list(gateway.clone()).await,
+        list(long.clone()).await,
         vec!["data/lcached/a.txt"],
         "listing must be served from cache within its TTL"
+    );
+    assert_eq!(
+        list_delim(long).await,
+        vec!["data/lcached/a.txt"],
+        "delimiter listings must use the same cached directory within its TTL"
     );
 
     tokio::time::sleep(Duration::from_millis(450)).await;
     assert_eq!(
-        list(gateway).await,
+        list(short.clone()).await,
         vec!["data/lcached/a.txt", "data/lcached/b.txt"],
         "listing must be re-read after its TTL"
+    );
+    assert_eq!(
+        list_delim(short).await,
+        vec!["data/lcached/a.txt", "data/lcached/b.txt"],
+        "delimiter listings must see the re-read directory too"
     );
 }
 

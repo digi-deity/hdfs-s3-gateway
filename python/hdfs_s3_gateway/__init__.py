@@ -112,11 +112,11 @@ def gateway(
     namenode_uri, hdfs_root, bucket_name, listen_addr, auth_secret:
         Optional overrides applied on top of the config file / environment.
     cache_enabled:
-        Highest-precedence switch for the metadata / block-map / directory-listing
-        caches (overrides ``[cache] enabled`` and ``HDFS_S3_CACHE_ENABLED``). Caches
-        are **off by default**; pass ``True`` to enable them, or ``False`` as an
-        incident kill switch if a cache bug is suspected. Check the effective value
-        with :attr:`Gateway.cache_enabled`.
+        Highest-precedence switch for the metadata / block-map / directory-listing /
+        negative caches (overrides ``[cache] enabled`` and
+        ``HDFS_S3_CACHE_ENABLED``). Caches are **off by default**; pass ``True`` to
+        enable them, or ``False`` as an incident kill switch if a cache bug is
+        suspected. Check the effective value with :attr:`Gateway.cache_enabled`.
     Logging is configured process-globally via :func:`set_logging` and is frozen once the
     first gateway is created. By default the gateway is **silent** and emits no logs
     (unless ``RUST_LOG`` is set). Logs never go to Python's ``stdout``.

@@ -232,7 +232,23 @@ async fn upstream_error_logged_with_request_id() {
         listen_addr: "127.0.0.1:0".to_string(),
         max_concurrent_requests: 2048,
         expose_upstream_errors: false,
-        hdfs_options: Default::default(),
+        // Fail fast against the closed port. The hdfs-native default is 15 failover
+        // attempts with exponential backoff, which makes this test take ~3 minutes;
+        // one immediate attempt exercises the same error path in about a second.
+        hdfs_options: std::collections::HashMap::from([
+            (
+                "dfs.client.failover.max.attempts".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "dfs.client.failover.sleep.base.millis".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "dfs.client.failover.sleep.max.millis".to_string(),
+                "5".to_string(),
+            ),
+        ]),
         hdfs_config_dir: None,
         hdfs_user: None,
         cache: Default::default(),
@@ -240,6 +256,7 @@ async fn upstream_error_logged_with_request_id() {
     };
     let client = ClientBuilder::new()
         .with_url(&config.namenode_uri)
+        .with_config(config.hdfs_options.clone())
         .build()
         .unwrap();
     let gateway = HdfsGateway::new(client, config.clone());
@@ -249,7 +266,12 @@ async fn upstream_error_logged_with_request_id() {
     let server_handle = tokio::spawn(serve(listener, service, std::future::pending()));
 
     let base = format!("http://{addr}/hdfs");
-    let http = HttpClient::builder().build().unwrap();
+    // Bound the test request itself: a regression in the upstream retry/failover path
+    // must fail this test, not hang the CI job.
+    let http = HttpClient::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
 
     let capture = CaptureSubscriber::new();
     let lines = capture.lines.clone();

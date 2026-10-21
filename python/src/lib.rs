@@ -284,9 +284,10 @@ impl Gateway {
         self.address.clone()
     }
 
-    /// Whether the metadata / block-map / directory-listing caches are enabled, as
-    /// resolved from the config file, `HDFS_S3_CACHE_ENABLED`, and the `cache_enabled`
-    /// constructor argument (highest precedence). Caches are OFF by default.
+    /// Whether the metadata / block-map / directory-listing / negative caches are
+    /// enabled, as resolved from the config file, `HDFS_S3_CACHE_ENABLED`, and the
+    /// `cache_enabled` constructor argument (highest precedence). Caches are OFF by
+    /// default.
     #[getter]
     fn cache_enabled(&self) -> bool {
         self.config.cache.enabled

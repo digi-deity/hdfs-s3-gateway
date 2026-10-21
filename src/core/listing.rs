@@ -97,22 +97,25 @@ pub struct Page {
     pub next_token: Option<String>,
 }
 
-/// Compute one page of a delimiter'd listing from the DIRECT CHILDREN of the prefix's
-/// directory: `files` (file keys under it) and `dirs` (directory keys under it).
+/// Compute one page of a delimiter'd listing from file keys and, for the canonical
+/// `/` delimiter, the DIRECT CHILDREN of the prefix's directory: `files` (file keys
+/// under it) and `dirs` (directory keys under it).
 ///
-/// This is the pure counterpart of the S3 layer's single non-recursive `getListing`:
-/// with a delimiter, a listing's output is fully determined by one directory level, so
-/// nothing deeper is ever needed (a recursive walk would cost one RPC per directory of
-/// the subtree for zero extra information).
+/// For `/`, a listing's output is fully determined by one directory level, so the
+/// non-recursive `dirs` are enough (and an EMPTY directory can surface as a
+/// CommonPrefix without an extra RPC). For any other delimiter the first occurrence
+/// can be arbitrarily deep in a key (`a/b.txt` with delimiter `.`), so `dirs` cannot
+/// describe the collapse: callers pass every matching file key in the subtree and an
+/// empty `dirs` slice. The S3 layer does exactly that.
 ///
 /// Semantics:
 /// - Contents are the file keys whose remainder after `prefix` contains no delimiter;
 ///   everything else collapses to a CommonPrefix (files included — e.g. prefix `t` and
 ///   key `t/ca` collapse to `t/`, because the remainder starts with `/`).
-/// - Directories always collapse to the CommonPrefix that would contain their keys;
-///   an EMPTY directory is still a real CommonPrefix here, because the caller lists one
+/// - With `/`, directories additionally collapse to the CommonPrefix that would contain
+///   their keys; an EMPTY directory is a real CommonPrefix because the caller lists one
 ///   directory non-recursively and cannot know emptiness without an extra RPC per
-///   directory — the very amplification this one-level path exists to avoid.
+///   directory — the very amplification that one-level path exists to avoid.
 /// - Directories whose key does not start with `prefix` can never contain a matching
 ///   key and are ignored.
 /// - Pagination interleaves Contents and CommonPrefixes in strict key order; the
@@ -144,20 +147,26 @@ pub fn paginate(
     let (mut contents, common) = list_to_contents(files, prefix, delimiter);
     let mut common_vec = common.into_vec();
 
-    // Directories collapse to the CommonPrefix that would contain all of their keys,
-    // mirroring `list_to_contents`' rule for file keys: everything up to and including
-    // the first delimiter after `prefix`; when the prefix is the directory's own name
-    // (no trailing slash, e.g. prefix `t` and directory `ta`), that is `ta/`.
-    for dir in dirs {
-        if !dir.starts_with(prefix) {
-            continue; // nothing under a non-matching directory can match the prefix
+    // Directory keys only describe direct children, so they can be collapsed exactly
+    // for `/` (where a direct child's key has no further `/` after the prefix). For
+    // any other delimiter the first occurrence can be deeper than the directory name,
+    // and callers pass the matching file keys instead (see the function docs).
+    if delimiter == Some("/") {
+        // Directories collapse to the CommonPrefix that would contain all of their
+        // keys, mirroring `list_to_contents`' rule for file keys: everything up to and
+        // including the first `/` after `prefix`; when the prefix is the directory's own
+        // name (no trailing slash, e.g. prefix `t` and directory `ta`), that is `ta/`.
+        for dir in dirs {
+            if !dir.starts_with(prefix) {
+                continue; // nothing under a non-matching directory can match the prefix
+            }
+            let rest = &dir[prefix.len()..];
+            let common_prefix = match rest.find('/') {
+                Some(i) => format!("{prefix}{}", &rest[..i + 1]),
+                None => format!("{dir}/"),
+            };
+            common_vec.push(common_prefix);
         }
-        let rest = &dir[prefix.len()..];
-        let common_prefix = match rest.find('/') {
-            Some(i) => format!("{prefix}{}", &rest[..i + 1]),
-            None => format!("{dir}/"),
-        };
-        common_vec.push(common_prefix);
     }
     common_vec.sort();
     common_vec.dedup();
@@ -211,7 +220,15 @@ pub fn cmp_dir_output(dir: &str, other: &str) -> Ordering {
         // `d + "/"` is greater whenever `d` already exhausts `other`.
         Ordering::Equal if d.len() >= o.len() => Ordering::Greater,
         // `d` is a strict prefix of `other`: compare the appended `/` with its next byte.
-        Ordering::Equal => b'/'.cmp(&o[d.len()]),
+        // If they are equal, `d + "/"` is a prefix of `other`; it is equal only when
+        // `other` is exactly `d + "/"`, and otherwise sorts before it. Returning
+        // `Equal` unconditionally here would compare `a/` as equal to `a/b`, breaking
+        // the ordering assumptions of the `partition_point` bounds above.
+        Ordering::Equal => match b'/'.cmp(&o[d.len()]) {
+            Ordering::Equal if o.len() == d.len() + 1 => Ordering::Equal,
+            Ordering::Equal => Ordering::Less,
+            other => other,
+        },
         other => other,
     }
 }
@@ -228,8 +245,18 @@ pub fn cmp_dir_keys(a: &str, b: &str) -> Ordering {
     let common = a.len().min(b.len());
     match a[..common].cmp(&b[..common]) {
         Ordering::Equal if a.len() == b.len() => Ordering::Equal,
-        Ordering::Equal if a.len() < b.len() => b'/'.cmp(&b[a.len()]),
-        Ordering::Equal => a[b.len()].cmp(&b'/'),
+        // When the appended `/` matches the longer key's next byte, the shorter
+        // output (`a + "/"`) is a strict prefix of the longer (`b + "/"`), so it
+        // sorts first. The old code returned `Equal`, making this helper claim two
+        // distinct directory outputs were equal.
+        Ordering::Equal if a.len() < b.len() => match b'/'.cmp(&b[a.len()]) {
+            Ordering::Equal => Ordering::Less,
+            other => other,
+        },
+        Ordering::Equal => match a[b.len()].cmp(&b'/') {
+            Ordering::Equal => Ordering::Greater,
+            other => other,
+        },
         other => other,
     }
 }
@@ -394,6 +421,22 @@ mod tests {
             size: 10,
             modification_time: 0,
         }
+    }
+
+    #[test]
+    fn directory_output_comparators_handle_prefix_boundaries() {
+        // `dir + "/"` vs an arbitrary key: `a/` is a prefix of `a/b`, so it sorts
+        // before it (not equal). It is equal only to the exact output `a/`.
+        assert_eq!(cmp_dir_output("a", "a/"), Ordering::Equal);
+        assert_eq!(cmp_dir_output("a", "a/b"), Ordering::Less);
+        assert_eq!(cmp_dir_output("a", "a!"), Ordering::Greater); // '/' > '!'
+        assert_eq!(cmp_dir_output("a", "a0"), Ordering::Less); // '/' < '0'
+
+        // Two directory outputs: `a/` is a prefix of `a/b/`, so `a` sorts first.
+        assert_eq!(cmp_dir_keys("a", "a/b"), Ordering::Less);
+        assert_eq!(cmp_dir_keys("a/b", "a"), Ordering::Greater);
+        assert_eq!(cmp_dir_keys("a", "a!"), Ordering::Greater); // "a/" > "a!/"
+        assert_eq!(cmp_dir_keys("a", "a"), Ordering::Equal);
     }
 
     #[test]
@@ -568,6 +611,19 @@ mod tests {
         assert!(page.contents.is_empty());
         assert_eq!(page.common_prefixes, vec!["a/empty/".to_string()]);
         assert!(!page.is_truncated);
+    }
+
+    #[test]
+    fn non_slash_delimiter_uses_file_keys_not_directories() {
+        // A directory's direct-child key is not enough to collapse for a non-"/"
+        // delimiter: the delimiter can occur deeper (`a/b.txt` with "."). The caller
+        // supplies the matching file keys and no directories; the directory entry must
+        // not leak a bogus `/`-collapsed prefix.
+        let files = vec![entry("a/b.txt")];
+        let dirs = vec!["a".to_string()];
+        let page = paginate(&files, &dirs, "", Some("."), None, 100);
+        assert!(page.contents.is_empty());
+        assert_eq!(page.common_prefixes, vec!["a/b.".to_string()]);
     }
 
     #[test]
