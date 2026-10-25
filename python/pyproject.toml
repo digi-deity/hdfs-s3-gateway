@@ -15,7 +15,7 @@ classifiers = [
 ]
 
 [project.urls]
-repository = "https://github.com/your-org/s3hdfsgateway"
+repository = "https://github.com/digi-deity/hdfs-s3-gateway"
 
 [project.optional-dependencies]
 test = ["pytest"]

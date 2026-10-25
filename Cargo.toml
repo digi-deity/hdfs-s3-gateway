@@ -9,7 +9,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Expose an HDFS cluster as a read-only S3-compatible endpoint"
-repository = "https://github.com/your-org/s3hdfsgateway"
+repository = "https://github.com/digi-deity/hdfs-s3-gateway"
 
 [lib]
 name = "hdfs_s3_gateway"
