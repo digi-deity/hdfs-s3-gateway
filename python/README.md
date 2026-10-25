@@ -4,6 +4,16 @@ Python bindings for the HDFS → S3 read-only gateway. This package wraps the Ru
 gateway so it can be driven from Python either as a foreground blocking call or as
 an in-process background server.
 
+## Install
+
+```bash
+pip install hdfs-s3-gateway
+```
+
+Python 3.10 or newer. Wheels are published for Linux (x86_64, aarch64), macOS
+(arm64), and Windows (x64), including free-threaded 3.14t builds. Other platforms
+(macOS Intel, musl/Alpine) build from source and need a Rust toolchain.
+
 ## Usage
 
 ```python
