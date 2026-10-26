@@ -58,6 +58,27 @@ def test_start_reports_address_and_stops():
         assert gw.is_running is False
 
 
+def test_accepts_hdfs_settings_as_keywords():
+    # These used to be reachable only through a TOML file.
+    gw = gateway(
+        listen_addr=LISTEN,
+        hdfs_user="alice",
+        hdfs_config_dir="/etc/hadoop/conf",
+        hdfs_options={"dfs.client.use.datanode.hostname": "true"},
+        **KW,
+    )
+    gw.start()
+    try:
+        assert gw.is_running is True
+    finally:
+        gw.stop()
+
+
+def test_rejects_unknown_keywords():
+    with pytest.raises(TypeError):
+        gateway(listen_addr=LISTEN, hdfs_typo="x", **KW)
+
+
 def test_serving_context_manager_always_stops():
     with serving(listen_addr=LISTEN, **KW) as gw:
         assert gw.address is not None

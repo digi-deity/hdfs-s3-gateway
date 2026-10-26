@@ -10,6 +10,7 @@
 //! release the GIL while it runs, so other Python threads (and the interpreter) stay
 //! responsive. `stop()` signals the server to gracefully drain and joins the thread.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -231,7 +232,7 @@ struct Gateway {
 #[pymethods]
 impl Gateway {
     #[new]
-    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, auth_secret=None, cache_enabled=None, log_level=None, log_to=None))]
+    #[pyo3(signature = (config_path=None, *, namenode_uri=None, hdfs_root=None, bucket_name=None, listen_addr=None, auth_secret=None, hdfs_user=None, hdfs_config_dir=None, hdfs_options=None, cache_enabled=None, log_level=None, log_to=None))]
     fn new(
         config_path: Option<PathBuf>,
         namenode_uri: Option<String>,
@@ -239,6 +240,9 @@ impl Gateway {
         bucket_name: Option<String>,
         listen_addr: Option<String>,
         auth_secret: Option<String>,
+        hdfs_user: Option<String>,
+        hdfs_config_dir: Option<PathBuf>,
+        hdfs_options: Option<HashMap<String, String>>,
         cache_enabled: Option<bool>,
         log_level: Option<String>,
         log_to: Option<String>,
@@ -250,6 +254,9 @@ impl Gateway {
             hdfs_root,
             bucket_name,
             auth_secret,
+            hdfs_user,
+            hdfs_config_dir,
+            hdfs_options: hdfs_options.map(|options| options.into_iter().collect()),
             // `cache_enabled` is applied after load (highest precedence), matching the
             // Rust CLI's --cache/--no-cache flags.
             no_cache: false,

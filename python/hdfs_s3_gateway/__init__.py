@@ -100,6 +100,9 @@ def gateway(
     bucket_name: Optional[str] = None,
     listen_addr: Optional[str] = None,
     auth_secret: Optional[str] = None,
+    hdfs_user: Optional[str] = None,
+    hdfs_config_dir: Optional[str] = None,
+    hdfs_options: Optional[dict[str, str]] = None,
     cache_enabled: Optional[bool] = None,
 ) -> "Gateway":
     """Construct a :class:`Gateway`.
@@ -111,6 +114,15 @@ def gateway(
         from environment variables and the keyword overrides below.
     namenode_uri, hdfs_root, bucket_name, listen_addr, auth_secret:
         Optional overrides applied on top of the config file / environment.
+    hdfs_user:
+        Effective HDFS user for the client. When omitted, hdfs-native derives it from
+        ``HADOOP_USER_NAME`` / ``HADOOP_PROXY_USER``.
+    hdfs_config_dir:
+        Directory hdfs-native reads ``core-site.xml``/``hdfs-site.xml`` from. Setting
+        this **replaces** the ``HADOOP_CONF_DIR`` -> ``HADOOP_HOME/etc/hadoop`` fallback.
+    hdfs_options:
+        Map of raw Hadoop configuration keys to values, passed to
+        ``ClientBuilder::with_config``. These override anything read from XML.
     cache_enabled:
         Highest-precedence switch for the metadata / block-map / directory-listing /
         negative caches (overrides ``[cache] enabled`` and
@@ -132,6 +144,9 @@ def gateway(
             bucket_name=bucket_name,
             listen_addr=listen_addr,
             auth_secret=auth_secret,
+            hdfs_user=hdfs_user,
+            hdfs_config_dir=hdfs_config_dir,
+            hdfs_options=hdfs_options,
             cache_enabled=cache_enabled,
             log_level=log_level,
             log_to=log_target,
@@ -144,6 +159,9 @@ def gateway(
             bucket_name=bucket_name,
             listen_addr=listen_addr,
             auth_secret=auth_secret,
+            hdfs_user=hdfs_user,
+            hdfs_config_dir=hdfs_config_dir,
+            hdfs_options=hdfs_options,
             cache_enabled=cache_enabled,
             log_level=log_level,
             log_to=log_target,
@@ -161,6 +179,9 @@ def serving(
     bucket_name: Optional[str] = None,
     listen_addr: Optional[str] = None,
     auth_secret: Optional[str] = None,
+    hdfs_user: Optional[str] = None,
+    hdfs_config_dir: Optional[str] = None,
+    hdfs_options: Optional[dict[str, str]] = None,
     cache_enabled: Optional[bool] = None,
 ) -> Iterator[Gateway]:
     """Context manager that starts the gateway in the background and stops it on exit.
@@ -184,6 +205,9 @@ def serving(
         bucket_name=bucket_name,
         listen_addr=listen_addr,
         auth_secret=auth_secret,
+        hdfs_user=hdfs_user,
+        hdfs_config_dir=hdfs_config_dir,
+        hdfs_options=hdfs_options,
         cache_enabled=cache_enabled,
     )
     gw.start()
