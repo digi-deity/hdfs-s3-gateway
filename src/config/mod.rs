@@ -39,6 +39,23 @@ pub struct CliArgs {
     #[arg(long)]
     pub auth_secret: Option<String>,
 
+    /// Override the effective HDFS user (`ClientBuilder::with_user`), e.g. for
+    /// impersonation. When unset, hdfs-native derives it from `HADOOP_USER_NAME` /
+    /// `HADOOP_PROXY_USER`.
+    #[arg(long, value_name = "USER")]
+    pub hdfs_user: Option<String>,
+
+    /// Override the directory hdfs-native reads `core-site.xml`/`hdfs-site.xml` from.
+    /// **CAUTION:** this replaces the `HADOOP_CONF_DIR` -> `HADOOP_HOME/etc/hadoop`
+    /// fallback entirely.
+    #[arg(long, value_name = "DIR")]
+    pub hdfs_config_dir: Option<PathBuf>,
+
+    /// Override a Hadoop configuration key, given as `KEY=VALUE`. Repeatable; these win
+    /// over values from the config file and from XML.
+    #[arg(long = "hdfs-option", value_name = "KEY=VALUE", value_parser = parse_hdfs_option)]
+    pub hdfs_options: Option<Vec<(String, String)>>,
+
     /// Force-disable the metadata, block-map, directory-listing and negative caches for
     /// this process. Incident kill switch: takes precedence over `[cache] enabled` and
     /// `HDFS_S3_CACHE_ENABLED`, so a suspected cache bug can be mitigated by changing
@@ -199,6 +216,14 @@ fn default_max_concurrent_requests() -> usize {
     2048
 }
 
+/// Split a `KEY=VALUE` argument for `--hdfs-option`.
+fn parse_hdfs_option(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err("expected KEY=VALUE, e.g. dfs.client.use.datanode.hostname=true".to_string()),
+    }
+}
+
 impl Config {
     /// Load configuration: a TOML file (if provided) merged with CLI overrides, then
     /// validated. Fails fast with a clear error on any missing/malformed value.
@@ -226,6 +251,15 @@ impl Config {
         }
         if let Some(v) = &args.auth_secret {
             config.auth_secret = Some(v.clone());
+        }
+        if let Some(v) = &args.hdfs_user {
+            config.hdfs_user = Some(v.clone());
+        }
+        if let Some(v) = &args.hdfs_config_dir {
+            config.hdfs_config_dir = Some(v.to_string_lossy().into_owned());
+        }
+        if let Some(pairs) = &args.hdfs_options {
+            config.hdfs_options.extend(pairs.iter().cloned());
         }
 
         // Cache kill switch, lowest to highest precedence:
@@ -351,9 +385,85 @@ mod tests {
             hdfs_root: None,
             bucket_name: None,
             auth_secret: None,
+            hdfs_user: None,
+            hdfs_config_dir: None,
+            hdfs_options: None,
             no_cache: false,
             cache: false,
         }
+    }
+
+    fn write_hdfs_config() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("gateway-hdfs-args-{}.toml", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "namenode_uri = \"hdfs://localhost:8020\"\n\
+             hdfs_root = \"/data\"\n\
+             bucket_name = \"hdfs\"\n\
+             hdfs_user = \"from-file\"\n\
+             hdfs_config_dir = \"/from/file\"\n\
+             hdfs_options = {{ \"from.file\" = \"1\", \"shared\" = \"file\" }}"
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn hdfs_settings_are_overridable_from_arguments() {
+        let mut arguments = args(Some(write_hdfs_config()));
+        arguments.hdfs_user = Some("alice".into());
+        arguments.hdfs_config_dir = Some(PathBuf::from("/etc/hadoop/conf"));
+        arguments.hdfs_options = Some(vec![
+            ("fs.defaultFS".into(), "hdfs://other:8020".into()),
+            ("shared".into(), "flag".into()),
+        ]);
+
+        let config = Config::load(&arguments).unwrap();
+
+        assert_eq!(config.hdfs_user.as_deref(), Some("alice"));
+        assert_eq!(config.hdfs_config_dir.as_deref(), Some("/etc/hadoop/conf"));
+        // Arguments are merged into the file's options and win on conflict.
+        assert_eq!(
+            config.hdfs_options.get("from.file").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            config.hdfs_options.get("shared").map(String::as_str),
+            Some("flag")
+        );
+        assert_eq!(
+            config.hdfs_options.get("fs.defaultFS").map(String::as_str),
+            Some("hdfs://other:8020")
+        );
+    }
+
+    #[test]
+    fn hdfs_option_flags_parse_and_reject_missing_values() {
+        let parsed = CliArgs::try_parse_from([
+            "gateway",
+            "--hdfs-option",
+            "a=1",
+            "--hdfs-option",
+            "b=x=y",
+            "--hdfs-user",
+            "alice",
+            "--hdfs-config-dir",
+            "/conf",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed.hdfs_options.unwrap(),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "x=y".to_string()),
+            ]
+        );
+        assert_eq!(parsed.hdfs_user.as_deref(), Some("alice"));
+        assert_eq!(parsed.hdfs_config_dir, Some(PathBuf::from("/conf")));
+        assert!(CliArgs::try_parse_from(["gateway", "--hdfs-option", "novalue"]).is_err());
     }
 
     fn write_config(cache_enabled: bool) -> PathBuf {

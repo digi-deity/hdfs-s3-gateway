@@ -32,6 +32,25 @@ with Gateway(config_path="gateway.toml") as gw:
     # ... use the endpoint ...
 ```
 
+The HDFS client settings are keywords too, so a config file is optional:
+
+```python
+with Gateway(
+    namenode_uri="hdfs://localhost:8020",
+    hdfs_root="/data",
+    bucket_name="hdfs",
+    hdfs_user="alice",                      # else HADOOP_USER_NAME / HADOOP_PROXY_USER
+    hdfs_config_dir="/etc/hadoop/conf",     # else HADOOP_CONF_DIR / HADOOP_HOME
+    hdfs_options={                          # raw Hadoop keys; override XML values
+        "dfs.client.use.datanode.hostname": "true",
+    },
+) as gw:
+    print(gw.address)
+```
+
+Each of these also exists as a flag (`--hdfs-user`, `--hdfs-config-dir`, repeatable
+`--hdfs-option KEY=VALUE`) and as a TOML key.
+
 Caches (metadata, block maps, directory listings and negative lookups) are **off by
 default**. Enable them for read-heavy workloads with `Gateway(..., cache_enabled=True)`
 (or `[cache] enabled = true` / `HDFS_S3_CACHE_ENABLED=1`). The same argument is the

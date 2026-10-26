@@ -64,10 +64,10 @@ fast at startup.
 | `listen_addr` | — | `--listen-addr` | `0.0.0.0:8080` | **Bind to a private interface in production** |
 | `max_concurrent_requests` | — | — | `2048` | Backpressure cap |
 | `expose_upstream_errors` | — | — | `true` | See [security](#upstream-error-exposure-expose_upstream_errors) |
-| `hdfs_options` | — | — | `{}` | Free-form `HashMap<String,String>` → `hdfs-native` `ClientBuilder::with_config` (raw Hadoop keys; **override** XML) |
-| `hdfs_config_dir` | — | — | `None` | Optional → `with_config_dir`; **replaces** `HADOOP_CONF_DIR`/`HADOOP_HOME` fallback when set |
-| `hdfs_user` | — | — | `None` | Optional → `with_user`; else `HADOOP_USER_NAME`/`HADOOP_PROXY_USER` |
-| `auth_secret` | `AUTH_SECRET` | `--auth-secret` | `None` | Optional shared secret. When **unset** (default), the gateway accepts **both** anonymous and any signed request. When **set**, a valid SigV4 signature is **required** (unsigned → `403`, wrong secret → `403 SignatureDoesNotMatch`). Not user identity — a shared password. |
+| `hdfs_options` | — | `--hdfs-option KEY=VALUE` (repeatable) | `{}` | Free-form `HashMap<String,String>` → `hdfs-native` `ClientBuilder::with_config` (raw Hadoop keys; **override** XML) |
+| `hdfs_config_dir` | — | `--hdfs-config-dir` | `None` | Optional → `with_config_dir`; **replaces** `HADOOP_CONF_DIR`/`HADOOP_HOME` fallback when set |
+| `hdfs_user` | — | `--hdfs-user` | `None` | Optional → `with_user`; else `HADOOP_USER_NAME`/`HADOOP_PROXY_USER` |
+| `auth_secret` | — | `--auth-secret` | `None` | Optional shared secret. When **unset** (default), the gateway accepts **both** anonymous and any signed request. When **set**, a valid SigV4 signature is **required** (unsigned → `403`, wrong secret → `403 SignatureDoesNotMatch`). Not user identity — a shared password. |
 | `[cache] enabled` | `HDFS_S3_CACHE_ENABLED` | `--cache` / `--no-cache` | `false` | Opt-in metadata/block-map/listing/negative caches. `--no-cache` is the highest-precedence incident kill switch (see [caching](#caching--consistency)). |
 
 Example `config.toml`:
