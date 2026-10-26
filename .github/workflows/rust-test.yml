@@ -95,7 +95,7 @@ jobs:
         # Use Hadoop 3.4.2-lean to match the version validated by the upstream
         # hdfs-native project.  The lean tarball extracts to hadoop-3.4.2/.
         run: |
-          wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.4.2/hadoop-3.4.2-lean.tar.gz
+          wget -q --timeout=60 --tries=3 https://archive.apache.org/dist/hadoop/common/hadoop-3.4.2/hadoop-3.4.2-lean.tar.gz
           tar -xf hadoop-3.4.2-lean.tar.gz -C $GITHUB_WORKSPACE
           echo "$GITHUB_WORKSPACE/hadoop-3.4.2/bin" >> $GITHUB_PATH
 

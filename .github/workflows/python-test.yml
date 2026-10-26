@@ -33,7 +33,7 @@ jobs:
 
       - name: Download Hadoop
         run: |
-          wget -q https://dlcdn.apache.org/hadoop/common/hadoop-3.5.0/hadoop-3.5.0.tar.gz
+          wget -q --timeout=60 --tries=3 https://archive.apache.org/dist/hadoop/common/hadoop-3.5.0/hadoop-3.5.0.tar.gz
           tar -xf hadoop-3.5.0.tar.gz -C $GITHUB_WORKSPACE
           echo "$GITHUB_WORKSPACE/hadoop-3.5.0/bin" >> $GITHUB_PATH
 
