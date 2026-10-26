@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "hdfs-s3-gateway"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "hdfs-s3-gateway-python"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "hdfs-native",
  "hdfs-s3-gateway",
